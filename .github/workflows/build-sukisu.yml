@@ -209,7 +209,7 @@ jobs:
           python3 - <<'PYEOF'
           import glob, re
           # 直接用真实路径 (drivers/kernelsu 是指向 KernelSU/kernel 的 symlink)
-          files = glob.glob('KernelSU/kernel/*.c')
+          files = glob.glob('KernelSU/kernel/*.c') + glob.glob('KernelSU/kernel/selinux/*.c')
           for f in files:
               s = open(f, encoding='utf-8').read()
               orig = s
@@ -252,6 +252,55 @@ jobs:
                   if '.handle_inode_event' in s:
                       raise SystemExit('leftover handle_inode_event')
                   print('patched: pkg_observer.c (fsnotify handle_event 5.4)')
+              # 1.95) sepolicy.c: KernelSU v4.1.0 的 add_filename_trans 按 5.9+ 的
+              #      SELinux filename_trans 结构编写 (filename_trans_key + stypes ebitmap
+              #      + next 链 + compat_filename_trans_count + filenametr_key_params +
+              #      4 参 hashtab_insert), 但 oscar (sm6375) 是 5.4 GKI 1.0, 旧式设计:
+              #        security/selinux/ss/policydb.h:91  struct filename_trans
+              #          { u32 stype; u32 ttype; u16 tclass; const char *name; };
+              #        policydb.h:98  struct filename_trans_datum { u32 otype; };
+              #      无 filename_trans_key / policydb_filenametr_search / stypes /
+              #      compat_filename_trans_count / filenametr_key_params;
+              #      hashtab_insert/search 为无 key_params 的 3/2 参版本 (hashtab.h:55/63);
+              #      services.c filename_compute_type 依赖 policydb->filename_trans_ttypes
+              #      ebitmap 跳查 (policydb.h:268) -> 插入新规则必须同时置位。
+              #      因此给整段 5.9+ 函数体加 #if >= 5.9 分叉, #else 提供 5.4 实现。
+              if f.endswith('sepolicy.c'):
+                  m = re.search(r'    struct filename_trans_key key;\n', s)
+                  assert m, 'sepolicy key marker not found'
+                  s = (s[:m.start()]
+                       + '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n'
+                       + s[m.start():])
+                  tail = ('    db->compat_filename_trans_count++;\n'
+                          '    return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;\n')
+                  assert tail in s, 'sepolicy tail marker not found'
+                  s = s.replace(tail, tail + (
+                      '#else\n'
+                      '    /* oscar (sm6375) 5.4 GKI 1.0: 旧式 filename_trans (5.8-) */\n'
+                      '    struct filename_trans key;\n'
+                      '    key.stype = src->value;\n'
+                      '    key.ttype = tgt->value;\n'
+                      '    key.tclass = cls->value;\n'
+                      '    key.name = (char *)o;\n'
+                      '\n'
+                      '    struct filename_trans_datum *trans =\n'
+                      '        hashtab_search(db->filename_trans, &key);\n'
+                      '    if (trans) {\n'
+                      '        trans->otype = def->value;\n'
+                      '    } else {\n'
+                      '        trans = (struct filename_trans_datum *)kcalloc(1, sizeof(*trans),\n'
+                      '                                   GFP_ATOMIC);\n'
+                      '        trans->otype = def->value;\n'
+                      '        struct filename_trans *new_key =\n'
+                      '            (struct filename_trans *)kzalloc(sizeof(*new_key), GFP_ATOMIC);\n'
+                      '        *new_key = key;\n'
+                      '        new_key->name = kstrdup(key.name, GFP_ATOMIC);\n'
+                      '        hashtab_insert(db->filename_trans, new_key, trans);\n'
+                      '        ebitmap_set_bit(&db->filename_trans_ttypes, key.ttype, 1);\n'
+                      '    }\n'
+                      '    return true;\n'
+                      '#endif\n'), 1)
+                  print('patched: selinux/sepolicy.c (add_filename_trans 5.4 分叉)')
               # 2) put_task_struct 在所有用到它的文件里显式 include sched/task.h
               if 'put_task_struct' in s and '#include <linux/sched/task.h>' not in s:
                   # 插到第一个 #include <linux/...> 之后 (保证先于使用点)
