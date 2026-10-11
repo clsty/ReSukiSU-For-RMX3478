@@ -211,6 +211,12 @@ jobs:
               #      实测 sm6375: kernel/seccomp.c 只有 'static void __put_seccomp_filter',
               #      include/linux/seccomp.h 只有 seccomp_filter_release/get_seccomp_filter。
               s = s.replace('put_seccomp_filter(tsk);', 'seccomp_filter_release(tsk);')
+              # 1.7) linux/pgtable.h: 5.10+ 才引入的头文件, sm6375 5.4 不存在 ->
+              #      sucompat.c  fatal error 'linux/pgtable.h' file not found。
+              #     该文件只 include 未用任何 pgtable API (grep 确认只有第 5 行),
+              #     且同时 include 了 <linux/mm.h> (5.4 中已含 asm/pgtable.h),
+              #     直接删除此 include 即可 (含换行, 避免空行堆积)。
+              s = s.replace('#include <linux/pgtable.h>\n', '')
               # 2) put_task_struct 在所有用到它的文件里显式 include sched/task.h
               if 'put_task_struct' in s and '#include <linux/sched/task.h>' not in s:
                   # 插到第一个 #include <linux/...> 之后 (保证先于使用点)
