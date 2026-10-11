@@ -89,24 +89,50 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: clang
-          key: clang-oscar-r510928-v1
+          key: clang-oscar-r510928-v2
 
-      - name: 下载 AOSP Clang (sparse checkout, 只拉 clang-r510928)
+      - name: 下载 AOSP Clang (锁定含 clang-r510928 的历史 commit, blob:none 部分克隆)
         if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
           # 只下载需要的 clang 版本目录 (~1.5GB)。
-          # 注意: 不能用 --filter=blob:none (promisor partial clone) —— 实测
-          # googlesource 的 on-demand blob 拉取会超时, 导致 clang-r510928/bin
-          # 目录为空, 编译直接 clang: command not found (2026-10 修复)。
-          # 普通克隆 + --sparse 只检树对象, sparse set 时按需拉取条目, 更可靠。
-          git clone --depth 1 --sparse \
+          # ★ 2026-10 修复:
+          #   1) googlesource master 已移除 clang-r510928 目录 (README 仍写死该版本,
+          #      直接 sparse-checkout 会得到空目录 → clang: command not found)。
+          #      因此必须从 master 历史里找到删除前的 commit 并 checkout (路线 A)。
+          #   2) 不能用纯 --sparse 克隆: 那会下载整棵树所有 blob (几十 GB) 超时。
+          #      必须保留 --filter=blob:none 部分克隆, 仅按需拉取 clang-r510928 的 blob。
+          #   3) googlesource 默认分支是 main-kernel (同样已删除 r510928), 历史在
+          #      master 分支 —— 逐步加深 master 深度直到路径历史出现 clang-r510928。
+          git clone --depth 1 --filter=blob:none --sparse \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang || exit 1
           cd clang
+          # 逐步加深 master 历史, 直到 git log 能列出 clang-r510928 的路径历史
+          DEPTH=1000
+          MAX_DEPTH=100000
+          DEST=""
+          while [ -z "$DEST" ]; do
+            echo ">> git fetch --depth $DEPTH origin master"
+            git fetch --depth "$DEPTH" origin master || exit 1
+            DEST=$(git log --format=%H FETCH_HEAD -- clang-r510928 2>/dev/null | head -1)
+            if [ -z "$DEST" ]; then
+              [ "$DEPTH" -ge "$MAX_DEPTH" ] && { echo "!! 最大深度 $MAX_DEPTH 仍未找到含 clang-r510928 的 commit, 中止"; exit 1; }
+              DEPTH=$((DEPTH * 2))
+            fi
+          done
+          echo "clang-r510928 路径历史最新 commit: $DEST ($(git log -1 --format=%s "$DEST"))"
+          # 该 commit 是"删除 clang-r510928"的 commit, 检出其父 commit (仍含该目录)
+          # 保险起见: 若 DEST 本身就含目录则直接用, 否则逐级回退找最近的含目录 commit
+          TARGET=$DEST
+          while ! git cat-file -e "$TARGET:clang-r510928" 2>/dev/null; do
+            TARGET=$(git rev-parse "$TARGET^") || exit 1
+          done
+          echo "checkout 目标 commit: $TARGET ($(git log -1 --format=%s "$TARGET"))"
+          git checkout -q "$TARGET"
           git sparse-checkout set clang-r510928
+          # 任何失败都不能留下坏目录进缓存
           if [ ! -x clang-r510928/bin/clang ]; then
-            echo "!! clang 未检出完整, 重试一次 sparse-checkout"
-            git sparse-checkout set clang-r510928
-            test -x clang-r510928/bin/clang || { echo "!! clang 下载失败, 中止 (防止缓存坏目录)"; exit 1; }
+            echo "!! clang 下载失败/不完整, 中止 (防止缓存坏目录)"
+            exit 1
           fi
           clang-r510928/bin/clang --version | head -1
           # 诊断: 确认链接器情况
@@ -119,7 +145,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: clang
-          key: clang-oscar-r510928-v1
+          key: clang-oscar-r510928-v2
 
       # ============ 4. ReSukiSU 集成 (锁定 v4.1.0 + symlink) ============
       # ReSukiSU = SukiSU-Ultra 的独立重构 fork (GPL-3.0)。
