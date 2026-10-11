@@ -301,6 +301,27 @@ jobs:
                       '    return true;\n'
                       '#endif\n'), 1)
                   print('patched: selinux/sepolicy.c (add_filename_trans 5.4 分叉)')
+              # 1.97) rules.c: get_policydb() 用 selinux_state.policy (5.10+ GKI2 的
+              #      selinux_policy 抽象), 但 oscar (sm6375) 5.4 的 struct selinux_state
+              #      (security/selinux/include/security.h:100-115) 没有 policy 成员,
+              #      只有 opaque 的 struct selinux_ss *ss (ss/services.h:26-28 内含
+              #      struct policydb policydb), 内核自己也是 &state->ss->policydb 访问
+              #      (services.c 十余处)。按 5.10 分叉: >=5.10 保留 GKI2 路径, 否则
+              #      用 ss->policydb。
+              if f.endswith('rules.c'):
+                  marker = ('    struct selinux_policy *policy = selinux_state.policy;\n'
+                            '    db = &policy->policydb;\n')
+                  assert marker in s, 'rules get_policydb marker not found'
+                  s = s.replace(marker, (
+                      '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
+                      '    struct selinux_policy *policy = selinux_state.policy;\n'
+                      '    db = &policy->policydb;\n'
+                      '#else\n'
+                      '    /* oscar (sm6375) 5.4 GKI 1.0: selinux_state 无 policy 成员;\n'
+                      '     * policydb 在 struct selinux_ss, 与内核 services.c 同款访问。 */\n'
+                      '    db = &selinux_state.ss->policydb;\n'
+                      '#endif\n'), 1)
+                  print('patched: selinux/rules.c (get_policydb 5.4: ss->policydb)')
               # 2) put_task_struct 在所有用到它的文件里显式 include sched/task.h
               if 'put_task_struct' in s and '#include <linux/sched/task.h>' not in s:
                   # 插到第一个 #include <linux/...> 之后 (保证先于使用点)
