@@ -176,6 +176,49 @@ jobs:
           ls -la drivers/kernelsu/ | head -8
           grep -n "kernelsu" drivers/Makefile
 
+      # ============ 4.45 ReSukiSU 5.4 (sm6375) API 兼容修复 ============
+      # Run#5 失败: clang18 编译 drivers/kernelsu 时报错 (ReSukiSU v4.1.0):
+      #   allowlist.c:427 'TWA_RESUME' undeclared
+      #   allowlist.c:430 'put_task_struct' implicit declaration
+      # 根因: LineageOS sm6375 (SM6375) 的 5.4 内核把 task_work_add 的第三参数
+      #   从上游 enum task_work_notify_t (TWA_NONE/TWA_RESUME/TWA_SIGNAL) 改成了
+      #   plain bool —— 高通裁剪版内核 task_work.h 无 TWA_* 枚举, 因此 v4.1.0
+      #   (按上游 API 编写) 编译失败。put_task_struct 声明在
+      #   include/linux/sched/task.h, 而 sm6375 的 sched.h 不包含它, 需显式 include。
+      # 修复: 全部 drivers/kernelsu/*.c 里 task_work_add(..., TWA_RESUME) ->
+      #   task_work_add(..., true) (bool 参数, true 语义等价 TWA_RESUME);
+      #   用到 put_task_struct 的文件统一补 #include <linux/sched/task.h>。
+      # 实测确认 (2026-10): sm6375 include/linux/task_work.h:
+      #   int task_work_add(struct task_struct *, struct callback_head *, bool);
+      #   grep TWA_ include/ 无任何枚举定义。
+      - name: 修复 ReSukiSU 的 5.4 (sm6375) task_work API 兼容
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import glob, re
+          # 直接用真实路径 (drivers/kernelsu 是指向 KernelSU/kernel 的 symlink)
+          files = glob.glob('KernelSU/kernel/*.c')
+          for f in files:
+              s = open(f, encoding='utf-8').read()
+              orig = s
+              # 1) task_work_add 第三参数: TWA_RESUME (上游枚举) -> true (sm6375 bool)
+              s = s.replace('TWA_RESUME', 'true')
+              # 2) put_task_struct 在所有用到它的文件里显式 include sched/task.h
+              if 'put_task_struct' in s and '#include <linux/sched/task.h>' not in s:
+                  # 插到第一个 #include <linux/...> 之后 (保证先于使用点)
+                  m = re.search(r'(#include <linux/[^\n]+>)', s)
+                  if m:
+                      ins = m.group(1) + '\n#include <linux/sched/task.h>'
+                      s = s[:m.start()] + ins + s[m.end():]
+              if s != orig:
+                  open(f, 'w', encoding='utf-8').write(s)
+                  print('patched:', f)
+          PYEOF
+          echo "--- 验证 ---"
+          grep -rn "TWA_RESUME" KernelSU/kernel/ | grep -v Binary || echo "OK: 无 TWA_RESUME 残留"
+          grep -l "put_task_struct" KernelSU/kernel/*.c | while read f; do grep -q "sched/task.h" "$f" || { echo "!! $f 缺 sched/task.h"; exit 1; }; done
+          echo "OK: put_task_struct 文件均已 include sched/task.h"
+
       # ============ 4.5 应用 SUSFS 5.4 patch (fs/ 层, 隐藏 SELinux 核心) ============
       # 官方 SUSFS 08-18 版 (v2.2.0) 只有 GKI 5.10 patch。oscar 是高通 5.4
       # QGKI —— 本仓库已移植为 5.4 版本 (patches/50_add_susfs_in_kernel-5.4.patch):
