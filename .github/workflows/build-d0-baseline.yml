@@ -17,6 +17,12 @@
 #   - 官方同款工具链参数: LD=ld.lld (LD_IS_LLD) + llvm-nm/llvm-objcopy
 #     (TOOLS_SUPPORT_RELR) + LLVM_IAS -> LTO_CLANG/THINLTO/CFI_CLANG/
 #     CFI_CLANG_SHADOW/RELR/COMPAT_VDSO 全部解锁, 与官方 config 一致
+#   - O= 分离构建 (官方 Android build.sh: make ... O=$OUT_DIR):
+#     ★ 必须 O= 才能注入 -I$(srctree)/$(src) (Makefile.lib), 否则
+#       kernel/sched/walt/trace.h 的 #include "./trace.h" 无法找到自身
+#       (in-tree 构建缺少 -I kernel/sched/walt -> define_trace.h:95
+#       'fatal error: ./trace.h file not found')。官方 Image 内含
+#       sched_update_pred_demand 等 walt trace 符号, 证明官方正是 O= 构建。
 #   - 不集成 KSU/SUSFS, 不加假 __cfi_slowpath, 不注释 PREL32 select
 #   - 版本串 = 官方一致: LOCALVERSION=-qgki + LOCALVERSION_AUTO=y + 干净 git
 #     树 (无 patch, 无 tag) -> setlocalversion 输出 -g84e7d691ee3a
@@ -49,6 +55,7 @@ env:
   DEVICE: 'oscar'
   KERNEL_COMMIT: '84e7d691ee3a094de68628c488847a4dd632e7eb'
   CLANG_VER: 'clang-r563880c'
+  KERNEL_OUT: 'kernel-out'   # O= 分离构建输出目录 (官方 Android build.sh O=$OUT_DIR)
 
 jobs:
   build:
@@ -111,12 +118,14 @@ jobs:
           # "-d CONFIG_PAGE_OWNER -d CONFIG_DEBUG_FS" (官方运行 config 实证两者均 off)。
           # 全量合并 holi_debug.config 反而会带入 CMA_DEBUGFS 等官方没有的 debug=y,
           # 故用等值 -d, 与官方 /proc/config.gz 零差异 (config_official.txt 已双向核对)
-          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+          # ★ O= 分离构建 (官方 build.sh 同款): 使 building_out_of_srctree=1,
+          #   kbuild 注入 -I$(srctree)/$(src) -> walt trace.h 相对 include 可解析
+          make O=${{ env.KERNEL_OUT }} ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy \
             STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
             KCFLAGS='-I. -Idrivers/usb/typec/tcpc' vendor/holi-qgki_defconfig
-          ./scripts/config -d DEBUG_FS -d PAGE_OWNER
-          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+          ./scripts/config --file ${{ env.KERNEL_OUT }}/.config -d DEBUG_FS -d PAGE_OWNER
+          make O=${{ env.KERNEL_OUT }} ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy \
             STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
             KCFLAGS='-I. -Idrivers/usb/typec/tcpc' olddefconfig
@@ -130,29 +139,29 @@ jobs:
             CONFIG_FS_ENCRYPTION CONFIG_FS_ENCRYPTION_ALGS \
             CONFIG_FS_ENCRYPTION_INLINE_CRYPT CONFIG_DM_CRYPT \
             CONFIG_CRYPTO_ECB CONFIG_CRYPTO_XTS; do
-            grep -q "^${k}=y" .config || { echo "!! ${k} 非 =y"; grep -E "^(# )?${k}=" .config || true; exit 1; }
+            grep -q "^${k}=y" ${{ env.KERNEL_OUT }}/.config || { echo "!! ${k} 非 =y"; grep -E "^(# )?${k}=" ${{ env.KERNEL_OUT }}/.config || true; exit 1; }
           done
           for k in CONFIG_DEBUG_FS CONFIG_PAGE_OWNER; do
-            grep -q "^# ${k} is not set" .config || { echo "!! ${k} 应关闭"; exit 1; }
+            grep -q "^# ${k} is not set" ${{ env.KERNEL_OUT }}/.config || { echo "!! ${k} 应关闭"; exit 1; }
           done
-          grep -q '^CONFIG_LOCALVERSION="-qgki"$' .config || { echo "!! LOCALVERSION 异常"; exit 1; }
-          grep -q '^CONFIG_LOCALVERSION_AUTO=y$' .config || { echo "!! LOCALVERSION_AUTO 应为 y (官方同款版本串机制)"; exit 1; }
+          grep -q '^CONFIG_LOCALVERSION="-qgki"$' ${{ env.KERNEL_OUT }}/.config || { echo "!! LOCALVERSION 异常"; exit 1; }
+          grep -q '^CONFIG_LOCALVERSION_AUTO=y$' ${{ env.KERNEL_OUT }}/.config || { echo "!! LOCALVERSION_AUTO 应为 y (官方同款版本串机制)"; exit 1; }
           echo "OK: 与官方 config 关键项一致 (LTO/CFI/LLD/RELR/COMPAT_VDSO/存储加密全解锁)"
-          grep -E "CONFIG_LTO_CLANG|CONFIG_THINLTO|CONFIG_CFI_CLANG|CONFIG_LD_IS_LLD|CONFIG_RELR|CONFIG_COMPAT_VDSO|CONFIG_LOCALVERSION" .config
-          cp .config ../kernel_config.txt
+          grep -E "CONFIG_LTO_CLANG|CONFIG_THINLTO|CONFIG_CFI_CLANG|CONFIG_LD_IS_LLD|CONFIG_RELR|CONFIG_COMPAT_VDSO|CONFIG_LOCALVERSION" ${{ env.KERNEL_OUT }}/.config
+          cp ${{ env.KERNEL_OUT }}/.config ../kernel_config.txt
 
       - name: 编译内核 (clang21 + LTO + CFI + LLD)
         run: |
           cd kernel
           export PATH=$PWD/../clang-prebuilts/${{ env.CLANG_VER }}/bin:$PATH
-          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+          make O=${{ env.KERNEL_OUT }} ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld NM=llvm-nm \
             OBJCOPY=llvm-objcopy STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
             KCFLAGS='-I. -Idrivers/usb/typec/tcpc' -j$(nproc)
-          ls -la arch/arm64/boot/Image vmlinux
+          ls -la ${{ env.KERNEL_OUT }}/arch/arm64/boot/Image ${{ env.KERNEL_OUT }}/vmlinux
           echo "--- 内核版本 (期 5.4.302-qgki-g84e7d691ee3a, clang21, +lto) ---"
-          strings -a arch/arm64/boot/Image | grep -m1 "Linux version"
-          strings -a arch/arm64/boot/Image | grep -m1 "clang version 21"
+          strings -a ${{ env.KERNEL_OUT }}/arch/arm64/boot/Image | grep -m1 "Linux version"
+          strings -a ${{ env.KERNEL_OUT }}/arch/arm64/boot/Image | grep -m1 "clang version 21"
 
       - name: 下载官方 boot.img (los_date, 校验 sha256)
         run: |
@@ -223,9 +232,9 @@ jobs:
           HDR_VER=$(cat boot_split/header_version 2>/dev/null || echo "4")
           echo "os_version=$OS_VER os_patch=$OS_PATCH header=$HDR_VER"
           echo "官方内核大小: $(stat -c%s boot_split/kernel)"
-          echo "D0 内核大小:   $(stat -c%s kernel/arch/arm64/boot/Image)"
+          echo "D0 内核大小:   $(stat -c%s kernel/${{ env.KERNEL_OUT }}/arch/arm64/boot/Image)"
           python3 mkbootimg/mkbootimg.py \
-            --kernel kernel/arch/arm64/boot/Image \
+            --kernel kernel/${{ env.KERNEL_OUT }}/arch/arm64/boot/Image \
             --ramdisk boot_split/ramdisk \
             --cmdline "$(cat boot_split/cmdline)" \
             --header_version $HDR_VER \
@@ -250,8 +259,8 @@ jobs:
           strings -a boot_split/kernel | grep -m1 "Linux version"
           strings -a boot_split/kernel | grep -m1 "clang version 21"
           echo "--- 确认无 KSU/SUSFS/ksud 符号 (对 vmlinux 查符号表 + 双保险 strings) ---"
-          if [ -f kernel/vmlinux ]; then
-            if $PWD/clang-prebuilts/${{ env.CLANG_VER }}/bin/llvm-nm kernel/vmlinux 2>/dev/null | grep -icE "ksu_|ksud|kernelsu|susfs" | grep -qE "^0$"; then
+          if [ -f kernel/${{ env.KERNEL_OUT }}/vmlinux ]; then
+            if $PWD/clang-prebuilts/${{ env.CLANG_VER }}/bin/llvm-nm kernel/${{ env.KERNEL_OUT }}/vmlinux 2>/dev/null | grep -icE "ksu_|ksud|kernelsu|susfs" | grep -qE "^0$"; then
               echo "OK: vmlinux 符号表无 KSU/SUSFS"
             else
               echo "!! vmlinux 检测到 KSU/SUSFS 符号"; exit 1
@@ -272,5 +281,5 @@ jobs:
             new_boot.img
             SHA256SUMS.txt
             kernel_config.txt
-            kernel/arch/arm64/boot/Image
+            kernel/${{ env.KERNEL_OUT }}/arch/arm64/boot/Image
           if-no-files-found: error
