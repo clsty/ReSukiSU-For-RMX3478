@@ -651,6 +651,11 @@ jobs:
       - name: 编译内核 (ccache 加速)
         run: |
           cd kernel
+          # 空 .scmversion 让 scripts/setlocalversion 的 scm_version() 直接返回空:
+          # 本树被大量 patch 弄脏且 HEAD 不在精确 tag 上, 否则 setlocalversion 会
+          # 在版本后追加 '+' (git 非 tag 状态标记), 混入 vermagic 导致 vendor 模块
+          # 拒载 (官方 nightly 内核无 '+': uname = 5.4.302-qgki-g84e7d691ee3a)。
+          touch .scmversion
           export PATH=$PWD/../clang/clang-r510928/bin:$PATH
           export CCACHE_DIR=$HOME/.ccache
           ccache -M 2G
@@ -669,9 +674,11 @@ jobs:
           ls -la arch/arm64/boot/Image
           echo "--- 内核版本 ---"
           strings arch/arm64/boot/Image | grep -m1 "Linux version"
-          # ★ vermagic 对齐断言: 必须与已刷系统内核完全一致
-          strings -a arch/arm64/boot/Image | grep -m1 "Linux version 5.4.302-qgki-g84e7d691ee3a" \
-            || { echo "!! 内核版本与已刷系统不一致 (期望 5.4.302-qgki-g84e7d691ee3a)"; exit 1; }
+          # ★ vermagic 对齐断言: 必须与已刷系统内核完全一致。
+          #   用 'g84e7d691ee3a (' 精确匹配 (官方版式: hash 后跟空格+括号);
+          #   若版本带 '+' (如 'g84e7d691ee3a+ (') 则匹配失败, 阻止 dirty 标记漏过。
+          strings -a arch/arm64/boot/Image | grep -m1 "Linux version 5.4.302-qgki-g84e7d691ee3a (" \
+            || { echo "!! 内核版本与已刷系统不一致 (期望 5.4.302-qgki-g84e7d691ee3a, 无 dirty '+')"; exit 1; }
           echo "OK: vermagic 与已刷系统一致 (5.4.302-qgki-g84e7d691ee3a)"
 
       # ============ 6. 原版 boot.img (缓存) ============
