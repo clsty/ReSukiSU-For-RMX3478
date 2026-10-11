@@ -187,19 +187,22 @@ jobs:
           # 仍需手动处理的 (rc1 未覆盖 / 与 oscar 5.4 的残余差异):
           python3 - <<'PYEOF'
           import glob, re
-          # 1) Kbuild KSU_VERSION fallback (无 miuix 历史时 expr 为空 -> 兜底 13000)
+          # 1) Kbuild KSU_VERSION fallback (无 git 历史时 expr 为空 -> 兜底 13000)
+          #    注意: heredoc 为 quoted 模式, bash 不展开 $; 用确定性行处理避免正则转义坑
           kb = 'KernelSU/kernel/Kbuild'
-          ks = open(kb, encoding='utf-8').read()
-          if '|| echo 13000' not in ks:
-              m = re.search(r'KSU_VERSION := \$\$\(shell expr ([^\n]+)\)', ks)
-              assert m, 'Kbuild KSU_VERSION expr line not found'
-              old = m.group(0)
-              new = old[:-1] + ' 2>/dev/null || echo 13000)'
-              ks = ks.replace(old, new)
-              open(kb, 'w', encoding='utf-8').write(ks)
+          lines = open(kb, encoding='utf-8').read().split('\n')
+          patched = False
+          for i, ln in enumerate(lines):
+              if ln.startswith('KSU_VERSION := $(shell expr ') and '|| echo 13000' not in ln:
+                  # 在行尾 ) 前注入: expr ... 2>/dev/null || echo 13000
+                  lines[i] = ln[:-1] + ' 2>/dev/null || echo 13000)'
+                  patched = True
+                  break
+          if patched:
+              open(kb, 'w', encoding='utf-8').write('\n'.join(lines))
               print('patched: KernelSU/kernel/Kbuild (KSU_VERSION fallback 13000)')
           else:
-              print('Kbuild KSU_VERSION fallback already present')
+              print('Kbuild KSU_VERSION fallback already present (or expr 行缺失)')
           # 2) sched/task.h include: put_task_struct 在 5.4 位于 linux/sched/task.h
           #    (rc1 若只 include linux/sched.h 则编译失败)
           files = glob.glob('KernelSU/kernel/**/*.c', recursive=True)
