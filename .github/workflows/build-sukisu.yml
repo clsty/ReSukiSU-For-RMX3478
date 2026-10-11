@@ -112,19 +112,24 @@ jobs:
           path: clang
           key: clang-oscar-r510928-v1
 
-      # ============ 4. ReSukiSU 集成 (全量 clone) ============
+      # ============ 4. ReSukiSU 集成 (锁定 v4.1.0 + symlink) ============
       # ReSukiSU = SukiSU-Ultra 的独立重构 fork (GPL-3.0)。
       # Kbuild 强制要求 KernelSU 目录是 git 仓库 (rev-list 计数版本号) +
       # 内核树根有 .git —— 因此 ReSukiSU 必须完整 clone (不能 --depth 1,
       # 否则 Kbuild 会触发 git fetch --unshallow 拖慢构建)。
+      # ★ 锁定 v4.1.0: ReSukiSU 最新 main 已重构为 BakaSU (v4.2.0-rc*),
+      #   其 kernel/tools/susfs_compat.mk 会校验 SUSFS 内核侧版本并拒绝旧版
+      #   —— 仓库自带的 SUSFS v2.2.0 (08-18) 5.4 移植 patch 无法通过, 编译中止。
+      #   v4.1.0 无此检查, 与仓库 SUSFS patch 兼容 (结构验证: kernel/ 目录)。
       # 集成: clone 到 KernelSU + symlink drivers/kernelsu → KernelSU/kernel。
-      - name: 集成 ReSukiSU (全量 clone + symlink)
+      - name: 集成 ReSukiSU (锁定 v4.1.0 + symlink)
         run: |
           cd kernel
           # 缓存恢复后 KernelSU 可能已存在，先删再 clone (全量, 不要 --depth 1)
           rm -rf KernelSU
           git clone https://github.com/ReSukiSU/ReSukiSU KernelSU
           cd KernelSU
+          git checkout v4.1.0
           echo "ReSukiSU commit: $(git log --oneline -1)"
           ls kernel/Kbuild kernel/Kconfig kernel/selinux/selinux.c && echo "结构正确 (kernel/ 目录)"
           cd ..
