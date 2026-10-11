@@ -1,10 +1,19 @@
 # ============================================================
-# D0 基线构建: 完全按 LineageOS 官方 oscar 构建条件的干净内核 boot
+# D0/E1 基线构建: 完全按 LineageOS 官方 oscar 构建条件的干净内核 boot
 # Realme Q5 / 9 5G (oscar, RMX3478) | SM6375 (holi) | 内核 5.4 QGKI
 #
 # 目的 (专家裁决后新增): 建立"与官方 nightly boot.img 内核层面等价"的可信
 #   对照基线, 用于定位 new_boot (ReSukiSU) init_user0_failed 的根因是否来自
 #   [无 LTO/CFI 自编译 + 假 __cfi_slowpath + 官方 CFI 模块] 的组合不兼容。
+#
+# ★ 双模式 (workflow_dispatch 的 mode 输入):
+#   - official (默认): D0 干净基线, 官方配方 (clang21 + LTO/CFI/LLD + O=), 无 KSU,
+#     artifact = d0-baseline-official-boot。设备实测 ✅ 正常开机。
+#   - ksu: E1 —— 同一官方配方基底 + ReSukiSU/SUSFS 集成, artifact = resukisu-official-lto。
+#     E0 判别实验 (2026-10-11 设备实测) 已定论: 断电关机根因是"clang18 非 LTO +
+#     假 __cfi_slowpath + 关 PREL32"失败配方本身, 与 KSU/SUSFS 补丁无关; 因此在
+#     已验证可开机的官方配方上构建 KSU。(失败配方对症: 不打 60_/70_/80_ hack,
+#     不做 TRACE_INCLUDE/tcpc/oplus 修复 —— O= + clang21 天然无需)。
 #
 # 与官方对齐点 (对照设备 /proc/config.gz = config_official.txt):
 #   - 内核源码 commit 84e7d691ee3a (lineage-23.2 分支 tip, 与已刷系统一致)
@@ -23,14 +32,15 @@
 #       (in-tree 构建缺少 -I kernel/sched/walt -> define_trace.h:95
 #       'fatal error: ./trace.h file not found')。官方 Image 内含
 #       sched_update_pred_demand 等 walt trace 符号, 证明官方正是 O= 构建。
-#   - 不集成 KSU/SUSFS, 不加假 __cfi_slowpath, 不注释 PREL32 select
-#   - 版本串 = 官方一致: LOCALVERSION=-qgki + LOCALVERSION_AUTO=y + 干净 git
-#     树 (无 patch, 无 tag) -> setlocalversion 输出 -g84e7d691ee3a
+#   - 版本串: official = 官方一致 (LOCALVERSION=-qgki + AUTO=y + 干净树 ->
+#     -g84e7d691ee3a); ksu = -d AUTO + 写死 LOCALVERSION="-qgki-g84e7d691ee3a"
+#     + touch .scmversion (集成 patch 弄脏树, 防 -dirty/+ 混入 vermagic)
 #
-# 用法: Actions -> D0 Baseline -> Run workflow (los_date 填 nightly 日期)
-# 产物 artifact: d0-baseline-official-boot (new_boot.img + SHA256SUMS + config)
+# 用法: Actions -> D0/E1 基线 -> Run workflow (los_date 填 nightly 日期, mode 选 ksu)
+# 产物 artifact: d0-baseline-official-boot / resukisu-official-lto
+#   (new_boot.img + SHA256SUMS + config)
 # ============================================================
-name: D0 Baseline (Official-parity boot)
+name: D0/E1 基线 (Official-parity boot / KSU-on-official)
 
 on:
   workflow_dispatch:
@@ -50,6 +60,14 @@ on:
         required: true
         type: string
         default: '20261005'
+      mode:
+        description: '构建模式: official = D0 官方配方干净基线(默认); ksu = 官方配方 + ReSukiSU/SUSFS 集成 (E0 判别后新方向)'
+        required: true
+        type: choice
+        options:
+          - official
+          - ksu
+        default: 'official'
 
 env:
   DEVICE: 'oscar'
@@ -60,6 +78,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    env:
+      MODE: ${{ github.event.inputs.mode }}
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -69,7 +89,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git make gcc flex bison bc cpio lz4 xz-utils \
             libssl-dev libncurses-dev libelf-dev unzip zip python3 \
-            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu ccache
           df -h "$GITHUB_WORKSPACE"
           FREE_KB=$(df --output=avail -k "$GITHUB_WORKSPACE" | tail -1)
           if [ "$FREE_KB" -lt 25000000 ]; then
@@ -110,6 +130,195 @@ jobs:
           test -x ${{ env.CLANG_VER }}/bin/ld.lld || { echo "!! ld.lld 缺失"; exit 1; }
           ls ${{ env.CLANG_VER }}/bin/ | grep -E "^(clang$|ld.lld$|llvm-(ar|nm|objcopy|strip)$)" | tr '\n' ' '; echo
 
+      # ============ ★ mode=ksu: KSU/SUSFS 集成 (官方配方基底, 无失败配方 hack) ============
+      # E0 判别结论 (2026-10-11 设备实测): 断电关机根因是"clang18 非 LTO + 假
+      #   __cfi_slowpath + 关 PREL32"配方本身, 与 KSU/SUSFS 补丁无关。因此现在在
+      #   D0 已验证可开机的官方配方 (clang21 + LTO/CFI/LLD + O=) 上集成 KSU。
+      #   失败配方 hack 全部不引入: 无 60_(CRC跳过)/70_(假__cfi_slowpath)/80_(关PREL32);
+      #   无 TRACE_INCLUDE/tcpc/oplus 修复 (O= + clang21 天然解决)。
+      #   保留的是 "KSU 对 5.4 的 API 适配" (task_work/sepolicy/rules/pkg_observer/
+      #   path_umount/SUSFS 5.4 patch)。
+      - name: 集成 ReSukiSU (锁定 v4.1.0 + symlink)
+        if: env.MODE == 'ksu'
+        run: |
+          cd kernel
+          rm -rf KernelSU
+          git clone https://github.com/ReSukiSU/ReSukiSU KernelSU
+          cd KernelSU
+          git checkout v4.1.0
+          echo "ReSukiSU commit: $(git log --oneline -1)"
+          ls kernel/Kbuild kernel/Kconfig kernel/selinux/selinux.c && echo "结构正确 (kernel/ 目录)"
+          cd ..
+          ln -sfn "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> drivers/Makefile
+          grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/kernelsu/Kconfig\"" drivers/Kconfig
+          ls -la drivers/kernelsu/ | head -5
+          grep -n "kernelsu" drivers/Makefile
+
+      - name: 修复 ReSukiSU 的 5.4 (sm6375) API 兼容
+        if: env.MODE == 'ksu'
+        run: |
+          cd kernel
+          if ! git -C KernelSU rev-parse --verify --quiet miuix >/dev/null; then
+            git -C KernelSU branch miuix HEAD
+          fi
+          echo "miuix 分支 commit 数: $(git -C KernelSU rev-list --count miuix)"
+          python3 - <<'PYEOF'
+          import glob, re
+          files = glob.glob('KernelSU/kernel/*.c') + glob.glob('KernelSU/kernel/selinux/*.c')
+          for f in files:
+              s = open(f, encoding='utf-8').read()
+              orig = s
+              s = s.replace('TWA_RESUME', 'true')
+              s = s.replace('put_seccomp_filter(tsk);', 'seccomp_filter_release(tsk);')
+              s = s.replace('#include <linux/pgtable.h>\n', '')
+              if f.endswith('pkg_observer.c'):
+                  m = re.search(r'static int ksu_handle_inode_event\([^)]*\)', s, re.S)
+                  assert m, 'fsnotify sig not found in pkg_observer.c'
+                  new_sig = ('static int ksu_handle_event(struct fsnotify_group *group,\n'
+                             '                  struct inode *inode, u32 mask, const void *data,\n'
+                             '                  int data_type, const struct qstr *file_name, u32 cookie,\n'
+                             '                  struct fsnotify_iter_info *iter_info)')
+                  s = s[:m.start()] + new_sig + s[m.end():]
+                  s = s.replace('.handle_inode_event = ksu_handle_inode_event,',
+                                '.handle_event = ksu_handle_event,')
+                  assert '.handle_inode_event' not in s, 'leftover handle_inode_event'
+                  print('patched: pkg_observer.c (fsnotify handle_event 5.4)')
+              if f.endswith('sepolicy.c'):
+                  m = re.search(r'    struct filename_trans_key key;\n', s)
+                  assert m, 'sepolicy key marker not found'
+                  s = (s[:m.start()]
+                       + '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n'
+                       + s[m.start():])
+                  tail = ('    db->compat_filename_trans_count++;\n'
+                          '    return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;\n')
+                  assert tail in s, 'sepolicy tail marker not found'
+                  s = s.replace(tail, tail + (
+                      '#else\n'
+                      '    /* oscar (sm6375) 5.4 GKI 1.0: 旧式 filename_trans (5.8-) */\n'
+                      '    struct filename_trans key;\n'
+                      '    key.stype = src->value;\n'
+                      '    key.ttype = tgt->value;\n'
+                      '    key.tclass = cls->value;\n'
+                      '    key.name = (char *)o;\n'
+                      '\n'
+                      '    struct filename_trans_datum *trans =\n'
+                      '        hashtab_search(db->filename_trans, &key);\n'
+                      '    if (trans) {\n'
+                      '        trans->otype = def->value;\n'
+                      '    } else {\n'
+                      '        trans = (struct filename_trans_datum *)kcalloc(1, sizeof(*trans),\n'
+                      '                                   GFP_ATOMIC);\n'
+                      '        trans->otype = def->value;\n'
+                      '        struct filename_trans *new_key =\n'
+                      '            (struct filename_trans *)kzalloc(sizeof(*new_key), GFP_ATOMIC);\n'
+                      '        *new_key = key;\n'
+                      '        new_key->name = kstrdup(key.name, GFP_ATOMIC);\n'
+                      '        hashtab_insert(db->filename_trans, new_key, trans);\n'
+                      '        ebitmap_set_bit(&db->filename_trans_ttypes, key.ttype, 1);\n'
+                      '    }\n'
+                      '    return true;\n'
+                      '#endif\n'), 1)
+                  print('patched: selinux/sepolicy.c (add_filename_trans 5.4 分叉)')
+              if f.endswith('rules.c'):
+                  marker = ('    struct selinux_policy *policy = selinux_state.policy;\n'
+                            '    db = &policy->policydb;\n')
+                  assert marker in s, 'rules get_policydb marker not found'
+                  s = s.replace(marker, (
+                      '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
+                      '    struct selinux_policy *policy = selinux_state.policy;\n'
+                      '    db = &policy->policydb;\n'
+                      '#else\n'
+                      '    db = &selinux_state.ss->policydb;\n'
+                      '#endif\n'), 1)
+                  print('patched: selinux/rules.c (get_policydb 5.4: ss->policydb)')
+              if 'put_task_struct' in s and '#include <linux/sched/task.h>' not in s:
+                  m = re.search(r'(#include <linux/[^\n]+>)', s)
+                  if m:
+                      ins = m.group(1) + '\n#include <linux/sched/task.h>'
+                      s = s[:m.start()] + ins + s[m.end():]
+              if s != orig:
+                  open(f, 'w', encoding='utf-8').write(s)
+                  print('patched:', f)
+          kb = 'KernelSU/kernel/Kbuild'
+          ks = open(kb, encoding='utf-8').read()
+          if '|| echo 13000' not in ks:
+              assert 'KSU_VERSION := $(shell expr 40000 + $(KSU_LOCAL_VERSION) - 2815)' in ks, 'Kbuild expr line not found'
+              ks = ks.replace(
+                  'KSU_VERSION := $(shell expr 40000 + $(KSU_LOCAL_VERSION) - 2815)',
+                  'KSU_VERSION := $(shell expr 40000 + $(KSU_LOCAL_VERSION) - 2815 2>/dev/null || echo 13000)')
+              open(kb, 'w', encoding='utf-8').write(ks)
+              print('patched: KernelSU/kernel/Kbuild (KSU_VERSION fallback 13000)')
+          else:
+              print('Kbuild KSU_VERSION fallback already present')
+          PYEOF
+          echo "--- 验证 ---"
+          grep -rn "TWA_RESUME" KernelSU/kernel/ | grep -v Binary || echo "OK: 无 TWA_RESUME 残留"
+          grep -rn "put_seccomp_filter" KernelSU/kernel/ | grep -v Binary || echo "OK: 无 put_seccomp_filter 残留 (改用 seccomp_filter_release)"
+          grep -l "put_task_struct" KernelSU/kernel/*.c | while read f; do grep -q "sched/task.h" "$f" || { echo "!! $f 缺 sched/task.h"; exit 1; }; done
+          echo "OK: put_task_struct 文件均已 include sched/task.h"
+
+      - name: 应用 SUSFS 5.4 patch
+        if: env.MODE == 'ksu'
+        run: |
+          cd kernel
+          patch -p1 < ../patches/50_add_susfs_in_kernel-5.4.patch
+          echo "--- 验证 SUSFS 已集成 ---"
+          ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
+          grep -n "susfs" fs/Makefile
+          grep -c "CONFIG_KSU_SUSFS" fs/namei.c
+
+      - name: 注入 path_umount 到 fs/namespace.c (修复 kernel_umount 链接)
+        if: env.MODE == 'ksu'
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          f = 'fs/namespace.c'
+          s = open(f, encoding='utf-8').read()
+          marker = 'static bool is_mnt_ns_file(struct dentry *dentry)'
+          assert marker in s, 'is_mnt_ns_file marker not found in namespace.c'
+          funcs = (
+              'int path_umount(struct path *path, int flags)\n'
+              '{\n'
+              '\tstruct mount *mnt;\n'
+              '\tint retval;\n'
+              '\n'
+              '\tif (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))\n'
+              '\t\treturn -EINVAL;\n'
+              '\n'
+              '\tif (!may_mount())\n'
+              '\t\treturn -EPERM;\n'
+              '\n'
+              '\tmnt = real_mount(path->mnt);\n'
+              '\tretval = -EINVAL;\n'
+              '\tif (path->dentry != path->mnt->mnt_root)\n'
+              '\t\tgoto out;\n'
+              '\tif (!check_mnt(mnt))\n'
+              '\t\tgoto out;\n'
+              '\tif (mnt->mnt.mnt_flags & MNT_LOCKED) /* Check optimistically */\n'
+              '\t\tgoto out;\n'
+              '\tretval = -EPERM;\n'
+              '\tif (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))\n'
+              '\t\tgoto out;\n'
+              '\n'
+              '\tretval = do_umount(mnt, flags);\n'
+              'out:\n'
+              '\t/* 不能调用 path_put(), 否则清除 mnt_expiry_mark (与 ksys_umount 同款) */\n'
+              '\tdput(path->dentry);\n'
+              '\tmntput_no_expire(mnt);\n'
+              '\treturn retval;\n'
+              '}\n'
+              '\n'
+          )
+          if 'int path_umount(struct path *path, int flags)' not in s:
+              s = s.replace(marker, funcs + marker, 1)
+              open(f, 'w', encoding='utf-8').write(s)
+              print('patched: fs/namespace.c (injected path_umount)')
+          else:
+              print('path_umount already present')
+          PYEOF
+          grep -n "int path_umount" fs/namespace.c
+
       - name: "配置内核 (官方等值: defconfig + LTO/CFI/LLD 全解锁)"
         run: |
           cd kernel
@@ -125,6 +334,25 @@ jobs:
             STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
             KCFLAGS='-I. -Idrivers/usb/typec/tcpc' vendor/holi-qgki_defconfig
           ./scripts/config --file ${{ env.KERNEL_OUT }}/.config -d DEBUG_FS -d PAGE_OWNER
+          # ★ mode=ksu: 开启 ReKSU + SUSFS 全部开关 (KSU_SUSFS 依赖 THREAD_INFO_IN_TASK
+          #   && 64BIT, 5.4 arm64 满足)。KALLSYMS/KALLSYMS_ALL 官方 config 即 =y (配方)。
+          #   LOCALVERSION: 集成 patch 弄脏 git 树后 AUTO=y 会自动追加 -dirty 进
+          #   vermagic (vendor 模块拒载), 故 ksu 模式必须 -d AUTO + 写死官方版本串
+          #   (与 build-sukisu 配方一致)。official 模式保持官方 AUTO=y + -qgki。
+          if [ "$MODE" = "ksu" ]; then
+            touch .scmversion   # 空文件: 抑制 setlocalversion 的 git 附加后缀 (防 '+' 混入 vermagic, 与 KSU v3 配方同机制)
+            ./scripts/config --file ${{ env.KERNEL_OUT }}/.config \
+              -e KSU -e KALLSYMS -e KALLSYMS_ALL \
+              -e KSU_SUSFS \
+              -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
+              -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
+              -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT \
+              -e KSU_SUSFS_SUS_MAP \
+              -d KSU_TRACEPOINT_HOOK \
+              -d CONFIG_LOCALVERSION_AUTO \
+              --set-str CONFIG_LOCALVERSION "-qgki-g84e7d691ee3a" || true
+          fi
           make O=${{ env.KERNEL_OUT }} ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy \
             STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
@@ -144,20 +372,56 @@ jobs:
           for k in CONFIG_DEBUG_FS CONFIG_PAGE_OWNER; do
             grep -q "^# ${k} is not set" ${{ env.KERNEL_OUT }}/.config || { echo "!! ${k} 应关闭"; exit 1; }
           done
-          grep -q '^CONFIG_LOCALVERSION="-qgki"$' ${{ env.KERNEL_OUT }}/.config || { echo "!! LOCALVERSION 异常"; exit 1; }
-          grep -q '^CONFIG_LOCALVERSION_AUTO=y$' ${{ env.KERNEL_OUT }}/.config || { echo "!! LOCALVERSION_AUTO 应为 y (官方同款版本串机制)"; exit 1; }
+          # LOCALVERSION 断言: official = 官方机制 (AUTO=y + LOCALVERSION=-qgki);
+          # ksu = 写死官方版本串 (AUTO 关, 避免 -dirty 混入 vermagic)
+          if [ "$MODE" = "official" ]; then
+            grep -q '^CONFIG_LOCALVERSION="-qgki"$' ${{ env.KERNEL_OUT }}/.config || { echo "!! LOCALVERSION 异常"; exit 1; }
+            grep -q '^CONFIG_LOCALVERSION_AUTO=y$' ${{ env.KERNEL_OUT }}/.config || { echo "!! LOCALVERSION_AUTO 应为 y (官方同款版本串机制)"; exit 1; }
+          else
+            grep -q '^CONFIG_LOCALVERSION="-qgki-g84e7d691ee3a"$' ${{ env.KERNEL_OUT }}/.config || { echo "!! ksu LOCALVERSION 未写死官方串"; exit 1; }
+            grep -q '^# CONFIG_LOCALVERSION_AUTO is not set' ${{ env.KERNEL_OUT }}/.config || { echo "!! ksu 模式 LOCALVERSION_AUTO 应为关 (防 -dirty)"; exit 1; }
+          fi
+          # ★ ksu 模式: KSU/SUSFS 开关必须已生效 (Kconfig 来自 KernelSU symlink + SUSFS patch)
+          if [ "$MODE" = "ksu" ]; then
+            for k in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_MAP; do
+              grep -q "^${k}=y" ${{ env.KERNEL_OUT }}/.config || { echo "!! ${k} 非 =y (KSU Kconfig 未生效?)"; grep -E "^(# )?${k}=" ${{ env.KERNEL_OUT }}/.config || true; exit 1; }
+            done
+            echo "OK: KSU 开关已生效 (CONFIG_KSU/CONFIG_KSU_SUSFS=y)"
+          fi
           echo "OK: 与官方 config 关键项一致 (LTO/CFI/LLD/RELR/COMPAT_VDSO/存储加密全解锁)"
           grep -E "CONFIG_LTO_CLANG|CONFIG_THINLTO|CONFIG_CFI_CLANG|CONFIG_LD_IS_LLD|CONFIG_RELR|CONFIG_COMPAT_VDSO|CONFIG_LOCALVERSION" ${{ env.KERNEL_OUT }}/.config
           cp ${{ env.KERNEL_OUT }}/.config ../kernel_config.txt
+
+      - name: 恢复 ccache (E1/KSU 迭代加速, key 区分 mode)
+        id: cache-ccache
+        if: env.MODE == 'ksu'
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.ccache
+          key: ccache-oscar-${{ github.event.inputs.kernel_branch }}-${{ env.MODE }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-oscar-${{ github.event.inputs.kernel_branch }}-${{ env.MODE }}-
 
       - name: 编译内核 (clang21 + LTO + CFI + LLD)
         run: |
           cd kernel
           export PATH=$PWD/../clang-prebuilts/${{ env.CLANG_VER }}/bin:$PATH
-          make O=${{ env.KERNEL_OUT }} ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+          # -DKSU_COMPAT_HAS_SELINUX_STATE: 5.4 高通 selinux_state 无 GKI 字段,
+          # 该宏触发 ReSukiSU selinux.c 的 5.4 兼容分支 (selinux_hide fake_state);
+          # 仅 ksu 模式需要 (official 无 KSU 源码, 加宏无意义)。
+          KFLAGS_LSU=""
+          MAKE_CC="clang"
+          if [ "$MODE" = "ksu" ]; then
+            KFLAGS_LSU=" -DKSU_COMPAT_HAS_SELINUX_STATE"
+            export CCACHE_DIR=$HOME/.ccache
+            ccache -M 2G
+            MAKE_CC="ccache clang"
+          fi
+          make O=${{ env.KERNEL_OUT }} ARCH=arm64 \
+            CC="$MAKE_CC" CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld NM=llvm-nm \
             OBJCOPY=llvm-objcopy STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
-            KCFLAGS='-I. -Idrivers/usb/typec/tcpc' -j$(nproc)
+            KCFLAGS="-I. -Idrivers/usb/typec/tcpc$KFLAGS_LSU" -j$(nproc)
           ls -la ${{ env.KERNEL_OUT }}/arch/arm64/boot/Image ${{ env.KERNEL_OUT }}/vmlinux
           echo "--- 内核版本 (期 5.4.302-qgki-g84e7d691ee3a, clang21, +lto) ---"
           strings -a ${{ env.KERNEL_OUT }}/arch/arm64/boot/Image | grep -m1 "Linux version"
@@ -222,7 +486,7 @@ jobs:
           fi
           echo "原版 boot.img 就绪: $(stat -c%s boot.img) bytes"
 
-      - name: 解包原 boot + 打包 D0 boot (官方参数)
+      - name: 解包原 boot + 打包 new boot (官方参数, 强制 v3)
         run: |
           git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
           python3 mkbootimg/unpack_bootimg.py --boot_img boot.img --out boot_split
@@ -252,7 +516,7 @@ jobs:
             -o new_boot.img
           ls -la new_boot.img
 
-      - name: 验证产物 (官方工具链串 + 无 KSU 符号 + sha256)
+      - name: 验证产物 (官方工具链串 + KSU 符号断言 + sha256)
         run: |
           # ★ 新 boot 必须为 header_version=3, 否则 ABL 不启动
           NEW_HDR=$(python3 mkbootimg/unpack_bootimg.py --boot_img new_boot.img --format mkbootimg -0 2>/dev/null | tr '\0' '\n' | grep -A1 '^--header_version$' | tail -1)
@@ -272,25 +536,46 @@ jobs:
           echo "--- 官方 Image 对照 (boot_split/kernel 应含相同串) ---"
           strings -a boot_split/kernel | grep -m1 "Linux version"
           strings -a boot_split/kernel | grep -m1 "clang version 21"
-          echo "--- 确认无 KSU/SUSFS/ksud 符号 (对 vmlinux 查符号表 + 双保险 strings) ---"
-          if [ -f kernel/${{ env.KERNEL_OUT }}/vmlinux ]; then
-            if $PWD/clang-prebuilts/${{ env.CLANG_VER }}/bin/llvm-nm kernel/${{ env.KERNEL_OUT }}/vmlinux 2>/dev/null | grep -icE "ksu_|ksud|kernelsu|susfs" | grep -qE "^0$"; then
-              echo "OK: vmlinux 符号表无 KSU/SUSFS"
-            else
-              echo "!! vmlinux 检测到 KSU/SUSFS 符号"; exit 1
+          echo "--- KSU/SUSFS 符号断言 ---"
+          if [ "$MODE" = "ksu" ]; then
+            # E1: 官方配方 + KSU 集成 -> 必须有 KSU/SUSFS 痕迹 (vmlinux 符号表 + 双保险)
+            KSU_HIT=0
+            if [ -f kernel/${{ env.KERNEL_OUT }}/vmlinux ]; then
+              KSU_HIT=$($PWD/clang-prebuilts/${{ env.CLANG_VER }}/bin/llvm-nm kernel/${{ env.KERNEL_OUT }}/vmlinux 2>/dev/null | grep -icE "ksu_|ksud|kernelsu|susfs" || true)
+              echo "vmlinux 符号表 KSU/SUSFS 匹配: $KSU_HIT"
             fi
+            STR_HIT=$(strings -a new_split/kernel | grep -icE "kernelsu|ksud|susfs|/data/adb" || true)
+            echo "kernel Image 字符串匹配: $STR_HIT"
+            [ "$STR_HIT" -gt 0 ] || { echo "!! ksu 模式未检测到 KSU/SUSFS 符号"; exit 1; }
+            echo "OK: KSU/SUSFS 已集成到官方配方内核 (E1)"
+          else
+            # D0: 必须无 KSU/SUSFS
+            if [ -f kernel/${{ env.KERNEL_OUT }}/vmlinux ]; then
+              if $PWD/clang-prebuilts/${{ env.CLANG_VER }}/bin/llvm-nm kernel/${{ env.KERNEL_OUT }}/vmlinux 2>/dev/null | grep -icE "ksu_|ksud|kernelsu|susfs" | grep -qE "^0$"; then
+                echo "OK: vmlinux 符号表无 KSU/SUSFS"
+              else
+                echo "!! vmlinux 检测到 KSU/SUSFS 符号"; exit 1
+              fi
+            fi
+            if strings -a new_split/kernel | grep -qicE "kernelsu|ksud|susfs|KSU_"; then
+              echo "!! kernel Image 发现 KSU/SUSFS 字符串 (D0 应无)"; exit 1
+            fi
+            echo "OK: 无 KSU/SUSFS 痕迹"
           fi
-          if strings -a new_split/kernel | grep -qicE "kernelsu|ksud|susfs|KSU_"; then
-            echo "!! kernel Image 发现 KSU/SUSFS 字符串 (D0 应无)"; exit 1
-          fi
-          echo "OK: 无 KSU/SUSFS 痕迹"
           sha256sum new_boot.img > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: 上传产物 (D0)
+      - name: 保存 ccache (E1/KSU 构建成功才更新, 供下次迭代加速)
+        if: env.MODE == 'ksu'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.ccache
+          key: ccache-oscar-${{ github.event.inputs.kernel_branch }}-${{ env.MODE }}-${{ github.run_id }}
+
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: d0-baseline-official-boot
+          name: ${{ env.MODE == 'ksu' && 'resukisu-official-lto' || 'd0-baseline-official-boot' }}
           path: |
             new_boot.img
             SHA256SUMS.txt
