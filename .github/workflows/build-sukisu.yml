@@ -217,6 +217,29 @@ jobs:
               #     且同时 include 了 <linux/mm.h> (5.4 中已含 asm/pgtable.h),
               #     直接删除此 include 即可 (含换行, 避免空行堆积)。
               s = s.replace('#include <linux/pgtable.h>\n', '')
+              # 1.9) pkg_observer.c: KernelSU v4.1.0 用 5.10+ 的 fsnotify API
+              #      (fsnotify_ops.handle_inode_event), 但 sm6375 是高通 5.4,
+              #      回调接口只有 handle_event (8 参数, 上游 6.0 前的经典 fsnotify)。
+              #      实测 sm6375 include/linux/fsnotify_backend.h (2026-10):
+              #        int (*handle_event)(fsnotify_group*, inode*, u32 mask,
+              #                            const void *data, int data_type,
+              #                            const qstr *file_name, u32 cookie,
+              #                            fsnotify_iter_info*);
+              #        fsnotify_alloc_group 只有 1 参 (pkg_observer.c 已有 6.0 分支, 不用改)
+              #      函数体只用到 file_name/mask, 不含 mark/dir/iter_info, 换签名安全。
+              if f.endswith('pkg_observer.c'):
+                  m = re.search(r'static int ksu_handle_inode_event\([^)]*\)', s, re.S)
+                  assert m, 'fsnotify sig not found in pkg_observer.c'
+                  new_sig = ('static int ksu_handle_event(struct fsnotify_group *group,\n'
+                             '                  struct inode *inode, u32 mask, const void *data,\n'
+                             '                  int data_type, const struct qstr *file_name, u32 cookie,\n'
+                             '                  struct fsnotify_iter_info *iter_info)')
+                  s = s[:m.start()] + new_sig + s[m.end():]
+                  s = s.replace('.handle_inode_event = ksu_handle_inode_event,',
+                                '.handle_event = ksu_handle_event,')
+                  if '.handle_inode_event' in s:
+                      raise SystemExit('leftover handle_inode_event')
+                  print('patched: pkg_observer.c (fsnotify handle_event 5.4)')
               # 2) put_task_struct 在所有用到它的文件里显式 include sched/task.h
               if 'put_task_struct' in s and '#include <linux/sched/task.h>' not in s:
                   # 插到第一个 #include <linux/...> 之后 (保证先于使用点)
