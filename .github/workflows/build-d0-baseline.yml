@@ -9,11 +9,16 @@
 # ★ 双模式 (workflow_dispatch 的 mode 输入):
 #   - official (默认): D0 干净基线, 官方配方 (clang21 + LTO/CFI/LLD + O=), 无 KSU,
 #     artifact = d0-baseline-official-boot。设备实测 ✅ 正常开机。
-#   - ksu: E1 —— 同一官方配方基底 + ReSukiSU/SUSFS 集成, artifact = resukisu-official-lto。
+#   - ksu: E1 —— 同一官方配方基底 + ReSukiSU/KSU 集成, artifact = resukisu-official-lto。
 #     E0 判别实验 (2026-10-11 设备实测) 已定论: 断电关机根因是"clang18 非 LTO +
 #     假 __cfi_slowpath + 关 PREL32"失败配方本身, 与 KSU/SUSFS 补丁无关; 因此在
 #     已验证可开机的官方配方上构建 KSU。(失败配方对症: 不打 60_/70_/80_ hack,
 #     不做 TRACE_INCLUDE/tcpc/oplus 修复 —— O= + clang21 天然无需)。
+#   ★ E1 现阶段 = KSU-only-on-official: SUSFS 未启用 —— 见 config 步骤注释
+#     (本仓库缺 SUSFS 官方 10_enable_susfs_for_ksu.patch 的 Kconfig 定义段, 且
+#     50_ patch 引用的 ksu_* 符号与 ReSukiSU v4.1.0 命名不符, 真启用会链接失败;
+#     历史 KSU v3 产物实际也是 KSU-only, 从未含 SUSFS 代码)。SUSFS 需符号适配
+#     后追加。
 #
 # 与官方对齐点 (对照设备 /proc/config.gz = config_official.txt):
 #   - 内核源码 commit 84e7d691ee3a (lineage-23.2 分支 tip, 与已刷系统一致)
@@ -334,8 +339,13 @@ jobs:
             STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
             KCFLAGS='-I. -Idrivers/usb/typec/tcpc' vendor/holi-qgki_defconfig
           ./scripts/config --file ${{ env.KERNEL_OUT }}/.config -d DEBUG_FS -d PAGE_OWNER
-          # ★ mode=ksu: 开启 ReKSU + SUSFS 全部开关 (KSU_SUSFS 依赖 THREAD_INFO_IN_TASK
-          #   && 64BIT, 5.4 arm64 满足)。KALLSYMS/KALLSYMS_ALL 官方 config 即 =y (配方)。
+          # ★ mode=ksu: 开启 ReKSU 本体开关。KALLSYMS/KALLSYMS_ALL 官方 config 即 =y。
+          #   ★ 重要: SUSFS 未在此启用 —— 本仓库只有 50_add_susfs_in_kernel-5.4.patch
+          #   (内核侧 #ifdef 代码), 但缺少 SUSFS 官方 10_enable_susfs_for_ksu.patch 的
+          #   Kconfig 定义段 (CONFIG_KSU_SUSFS), 且 50_ patch 引用的 ksu_* 符号与
+          #   ReSukiSU v4.1.0 (is_ksu_domain/ksu_input_hook) 不匹配, 真启用会链接失败。
+          #   因此 E1 先构建 KSU-only-on-official (判别官方配方上 KSU 能否开机),
+          #   SUSFS 需单独符号适配后再加 (见报告)。
           #   LOCALVERSION: 集成 patch 弄脏 git 树后 AUTO=y 会自动追加 -dirty 进
           #   vermagic (vendor 模块拒载), 故 ksu 模式必须 -d AUTO + 写死官方版本串
           #   (与 build-sukisu 配方一致)。official 模式保持官方 AUTO=y + -qgki。
@@ -343,13 +353,6 @@ jobs:
             touch .scmversion   # 空文件: 抑制 setlocalversion 的 git 附加后缀 (防 '+' 混入 vermagic, 与 KSU v3 配方同机制)
             ./scripts/config --file ${{ env.KERNEL_OUT }}/.config \
               -e KSU -e KALLSYMS -e KALLSYMS_ALL \
-              -e KSU_SUSFS \
-              -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
-              -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
-              -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-              -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT \
-              -e KSU_SUSFS_SUS_MAP \
-              -d KSU_TRACEPOINT_HOOK \
               -d CONFIG_LOCALVERSION_AUTO \
               --set-str CONFIG_LOCALVERSION "-qgki-g84e7d691ee3a" || true
           fi
@@ -381,12 +384,15 @@ jobs:
             grep -q '^CONFIG_LOCALVERSION="-qgki-g84e7d691ee3a"$' ${{ env.KERNEL_OUT }}/.config || { echo "!! ksu LOCALVERSION 未写死官方串"; exit 1; }
             grep -q '^# CONFIG_LOCALVERSION_AUTO is not set' ${{ env.KERNEL_OUT }}/.config || { echo "!! ksu 模式 LOCALVERSION_AUTO 应为关 (防 -dirty)"; exit 1; }
           fi
-          # ★ ksu 模式: KSU/SUSFS 开关必须已生效 (Kconfig 来自 KernelSU symlink + SUSFS patch)
+          # ★ ksu 模式: KSU 开关必须已生效 (Kconfig 来自 KernelSU symlink 的 kernel/Kconfig)
           if [ "$MODE" = "ksu" ]; then
-            for k in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_MAP; do
+            for k in CONFIG_KSU CONFIG_KSU_MANUAL_SU; do
               grep -q "^${k}=y" ${{ env.KERNEL_OUT }}/.config || { echo "!! ${k} 非 =y (KSU Kconfig 未生效?)"; grep -E "^(# )?${k}=" ${{ env.KERNEL_OUT }}/.config || true; exit 1; }
             done
-            echo "OK: KSU 开关已生效 (CONFIG_KSU/CONFIG_KSU_SUSFS=y)"
+            if grep -q "^CONFIG_KSU_SUSFS=y" ${{ env.KERNEL_OUT }}/.config; then
+              echo "!! 意外: CONFIG_KSU_SUSFS=y (SUSFS 未适配不应启用)"; exit 1
+            fi
+            echo "OK: KSU 本体开关已生效 (CONFIG_KSU=y; SUSFS 保持未启用)"
           fi
           echo "OK: 与官方 config 关键项一致 (LTO/CFI/LLD/RELR/COMPAT_VDSO/存储加密全解锁)"
           grep -E "CONFIG_LTO_CLANG|CONFIG_THINLTO|CONFIG_CFI_CLANG|CONFIG_LD_IS_LLD|CONFIG_RELR|CONFIG_COMPAT_VDSO|CONFIG_LOCALVERSION" ${{ env.KERNEL_OUT }}/.config
@@ -536,18 +542,23 @@ jobs:
           echo "--- 官方 Image 对照 (boot_split/kernel 应含相同串) ---"
           strings -a boot_split/kernel | grep -m1 "Linux version"
           strings -a boot_split/kernel | grep -m1 "clang version 21"
-          echo "--- KSU/SUSFS 符号断言 ---"
+          echo "--- KSU 符号断言 (E1 = KSU-only-on-official; SUSFS 未启用) ---"
           if [ "$MODE" = "ksu" ]; then
-            # E1: 官方配方 + KSU 集成 -> 必须有 KSU/SUSFS 痕迹 (vmlinux 符号表 + 双保险)
+            # E1: 官方配方 + KSU 集成 -> 必须有 KSU 痕迹; 且不支持 SUSFS 符号
+            # (SUSFS 的 Kconfig 定义缺失 + 50_ patch 符号与 ReSukiSU v4.1.0 不匹配,
+            # 见 config 步骤注释; 真启用会链接失败。故只验证 KSU 本体)
             KSU_HIT=0
             if [ -f kernel/${{ env.KERNEL_OUT }}/vmlinux ]; then
-              KSU_HIT=$($PWD/clang-prebuilts/${{ env.CLANG_VER }}/bin/llvm-nm kernel/${{ env.KERNEL_OUT }}/vmlinux 2>/dev/null | grep -icE "ksu_|ksud|kernelsu|susfs" || true)
-              echo "vmlinux 符号表 KSU/SUSFS 匹配: $KSU_HIT"
+              KSU_HIT=$($PWD/clang-prebuilts/${{ env.CLANG_VER }}/bin/llvm-nm kernel/${{ env.KERNEL_OUT }}/vmlinux 2>/dev/null | grep -icE "kernelsu|ksud|ksu_init|ksu_core" || true)
+              echo "vmlinux 符号表 KSU 匹配: $KSU_HIT"
             fi
-            STR_HIT=$(strings -a new_split/kernel | grep -icE "kernelsu|ksud|susfs|/data/adb" || true)
-            echo "kernel Image 字符串匹配: $STR_HIT"
-            [ "$STR_HIT" -gt 0 ] || { echo "!! ksu 模式未检测到 KSU/SUSFS 符号"; exit 1; }
-            echo "OK: KSU/SUSFS 已集成到官方配方内核 (E1)"
+            STR_HIT=$(strings -a new_split/kernel | grep -icE "kernelsu|ksud|/data/adb|KernelSU" || true)
+            echo "kernel Image KSU 字符串匹配: $STR_HIT"
+            [ "$STR_HIT" -gt 0 ] || { echo "!! ksu 模式未检测到 KSU 符号"; exit 1; }
+            if strings -a new_split/kernel | grep -qicE "susfs|SUSFS"; then
+              echo "!! E1 不应含 SUSFS 符号 (SUSFS 未启用, 50_ patch 全 #ifdef off)"; exit 1
+            fi
+            echo "OK: KSU 已集成到官方配方内核, SUSFS 未启用 (E1)"
           else
             # D0: 必须无 KSU/SUSFS
             if [ -f kernel/${{ env.KERNEL_OUT }}/vmlinux ]; then
