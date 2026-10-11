@@ -75,6 +75,23 @@ jobs:
           path: kernel
           key: kernel-oscar-${{ github.event.inputs.kernel_branch }}
 
+      # ★ 内核 commit 对齐已刷系统 (2026-10-11 设备实证):
+      #   主设备 RE547D (RMX3478) 运行 LineageOS 23.2 nightly-20261005-oscar,
+      #   内核 = 5.4.302-qgki-g84e7d691ee3a。git ls-remote 实证 LineageOS
+      #   android_kernel_realme_sm6375 的 lineage-23.2 分支 tip 就是
+      #   84e7d691ee3a094de68628c488847a4dd632e7eb (= g84e7d691ee3a) ——
+      #   与已刷系统完全一致。若缓存恢复的是更早 commit, 这里 fetch+强制
+      #   checkout 保证源码与已刷系统同版 (避免内核与 vendor 模块二进制不匹配)。
+      - name: 锁定内核 commit 与已刷系统同版 (g84e7d691ee3a)
+        run: |
+          cd kernel
+          if ! git cat-file -e 84e7d691ee3a094de68628c488847a4dd632e7eb^{commit} 2>/dev/null; then
+            git fetch --depth 1 origin "${{ github.event.inputs.kernel_branch }}"
+          fi
+          git checkout -f 84e7d691ee3a094de68628c488847a4dd632e7eb
+          echo "内核 commit 已锁定: $(git rev-parse --short HEAD)"
+          ls arch/arm64/configs/vendor/ | grep holi
+
       # ============ 2. 编译依赖 ============
       - name: 安装编译依赖
         run: |
@@ -369,6 +386,66 @@ jobs:
           grep -n "susfs" fs/Makefile
           grep -c "CONFIG_KSU_SUSFS" fs/namei.c
 
+      # ============ 4.55 注入 path_umount (KernelSU kernel_umount.o 链接依赖) ============
+      # Run#12 链接失败: drivers/kernelsu/kernel_umount.o 引用 path_umount 未定义。
+      # KernelSU v4.1.0 假定内核自带 path_umount (AOSP GKI), 但 oscar 是高通 QGKI
+      # 5.4, fs/namespace.c 已删掉该函数 (kern_unmount 只释放长时引用, 非真卸载)。
+      # 参照 KernelSU SUSFS 官方做法 (kernel_patches android 系列 patch):
+      #   向 fs/namespace.c 注入 path_umount —— 与同文件的 ksys_umount 同款逻辑
+      #   (may_mount/can_umount+do_umount 校验), do_umount 是 namespace.c 内 static,
+      #   必须注入到同文件才能调用。释放引用用 dput+mntput_no_expire (不调 path_put,
+      #   避免清除 mnt_expiry_mark, 与 ksys_umount 一致); path ref 由调用方
+      #   try_umount(kern_path) 获取、由本函数释放。
+      - name: 注入 path_umount 到 fs/namespace.c (修复 kernel_umount 链接)
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          f = 'fs/namespace.c'
+          s = open(f, encoding='utf-8').read()
+          marker = 'static bool is_mnt_ns_file(struct dentry *dentry)'
+          assert marker in s, 'is_mnt_ns_file marker not found in namespace.c'
+          funcs = (
+              'int path_umount(struct path *path, int flags)\n'
+              '{\n'
+              '\tstruct mount *mnt;\n'
+              '\tint retval;\n'
+              '\n'
+              '\tif (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))\n'
+              '\t\treturn -EINVAL;\n'
+              '\n'
+              '\tif (!may_mount())\n'
+              '\t\treturn -EPERM;\n'
+              '\n'
+              '\tmnt = real_mount(path->mnt);\n'
+              '\tretval = -EINVAL;\n'
+              '\tif (path->dentry != path->mnt->mnt_root)\n'
+              '\t\tgoto out;\n'
+              '\tif (!check_mnt(mnt))\n'
+              '\t\tgoto out;\n'
+              '\tif (mnt->mnt.mnt_flags & MNT_LOCKED) /* Check optimistically */\n'
+              '\t\tgoto out;\n'
+              '\tretval = -EPERM;\n'
+              '\tif (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))\n'
+              '\t\tgoto out;\n'
+              '\n'
+              '\tretval = do_umount(mnt, flags);\n'
+              'out:\n'
+              '\t/* 不能调用 path_put(), 否则清除 mnt_expiry_mark (与 ksys_umount 同款) */\n'
+              '\tdput(path->dentry);\n'
+              '\tmntput_no_expire(mnt);\n'
+              '\treturn retval;\n'
+              '}\n'
+              '\n'
+          )
+          if 'int path_umount(struct path *path, int flags)' not in s:
+              s = s.replace(marker, funcs + marker, 1)
+              open(f, 'w', encoding='utf-8').write(s)
+              print('patched: fs/namespace.c (injected path_umount)')
+          else:
+              print('path_umount already present')
+          PYEOF
+          grep -n "int path_umount" fs/namespace.c
+
       # ============ 4.6 跳过 modversions CRC 校验 (vendor 模块兼容) ============
       # 现象: 刷入自编译内核后 WiFi/蓝牙/音频全挂, dmesg 报
       #   "disagrees about version of symbol module_layout"
@@ -533,13 +610,16 @@ jobs:
           # SPOOF_UNAME/ENABLE_LOG/HIDE_KSU_SUSFS_SYMBOLS/SPOOF_CMDLINE_OR_BOOTCONFIG/
           # OPEN_REDIRECT/SUS_MAP)。ReSukiSU Kconfig: KSU_SUSFS 依赖
           # THREAD_INFO_IN_TASK && 64BIT —— 5.4 arm64 满足。
-          # ★ 版本号必须与官方 ROM 完全一致 (dmesg 实证 2026-08):
+          # ★ 版本号必须与官方 ROM 完全一致 (2026-10-11 设备实证更新):
           #   vendor 分区预编译模块 (qca_cld3_wlan.ko/btpower/adsp/q6 等) 加载时
-          #   校验 vermagic, 官方模块期望 '5.4.302-qgki-gc8c87694a044 SMP preempt
+          #   校验 vermagic, 本机 (已刷 23.2-20261005-nightly-oscar) 运行内核
+          #   = 5.4.302-qgki-g84e7d691ee3a, 官方模块期望
+          #   '5.4.302-qgki-g84e7d691ee3a SMP preempt
           #   mod_unload modversions aarch64'。若版本带 -dirty (patch 后 git 树脏 +
           #   CONFIG_LOCALVERSION_AUTO) 或关闭 MODVERSIONS (vermagic 少 modversions
           #   标记), 全部 vendor 模块拒绝加载 (WiFi/蓝牙/音频全挂)。
-          # 修复: -d CONFIG_LOCALVERSION_AUTO 去掉自动后缀, 写死官方 LOCALVERSION;
+          # 修复: -d CONFIG_LOCALVERSION_AUTO 去掉自动后缀, 写死官方 LOCALVERSION
+          #   (g84e7d691ee3a = lineage-23.2 分支 tip, 与已刷系统一致);
           #   保持 MODVERSIONS=y (官方默认 y)。
           # KSU_TRACEPOINT_HOOK 是 GKI 2 (5.10+) 的 tracepoint 模式, 5.4 不用, 显式关闭。
           ./scripts/config -e KSU -e KALLSYMS -e KALLSYMS_ALL \
@@ -551,7 +631,7 @@ jobs:
             -e KSU_SUSFS_SUS_MAP \
             -d KSU_TRACEPOINT_HOOK \
             -d CONFIG_LOCALVERSION_AUTO \
-            --set-str CONFIG_LOCALVERSION "-qgki-gc8c87694a044" || true
+            --set-str CONFIG_LOCALVERSION "-qgki-g84e7d691ee3a" || true
           if [ -n "${{ github.event.inputs.custom_version }}" ]; then
             ./scripts/config --set-str LOCALVERSION "-${{ github.event.inputs.custom_version }}"
           fi
@@ -589,6 +669,10 @@ jobs:
           ls -la arch/arm64/boot/Image
           echo "--- 内核版本 ---"
           strings arch/arm64/boot/Image | grep -m1 "Linux version"
+          # ★ vermagic 对齐断言: 必须与已刷系统内核完全一致
+          strings -a arch/arm64/boot/Image | grep -m1 "Linux version 5.4.302-qgki-g84e7d691ee3a" \
+            || { echo "!! 内核版本与已刷系统不一致 (期望 5.4.302-qgki-g84e7d691ee3a)"; exit 1; }
+          echo "OK: vermagic 与已刷系统一致 (5.4.302-qgki-g84e7d691ee3a)"
 
       # ============ 6. 原版 boot.img (缓存) ============
       - name: 恢复原版 boot.img 缓存
