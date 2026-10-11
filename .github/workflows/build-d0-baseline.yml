@@ -1,0 +1,276 @@
+# ============================================================
+# D0 基线构建: 完全按 LineageOS 官方 oscar 构建条件的干净内核 boot
+# Realme Q5 / 9 5G (oscar, RMX3478) | SM6375 (holi) | 内核 5.4 QGKI
+#
+# 目的 (专家裁决后新增): 建立"与官方 nightly boot.img 内核层面等价"的可信
+#   对照基线, 用于定位 new_boot (ReSukiSU) init_user0_failed 的根因是否来自
+#   [无 LTO/CFI 自编译 + 假 __cfi_slowpath + 官方 CFI 模块] 的组合不兼容。
+#
+# 与官方对齐点 (对照设备 /proc/config.gz = config_official.txt):
+#   - 内核源码 commit 84e7d691ee3a (lineage-23.2 分支 tip, 与已刷系统一致)
+#   - 官方同款 prebuilt clang21 (clang-r563880c, Image 内 'clang version 21.0.0')
+#   - vendor/holi-qgki_defconfig (自带 LTO_CLANG/CFI_CLANG/LOCALVERSION=-qgki)
+#   - 合并官方 debugfs.config 的正式等值: -d CONFIG_DEBUG_FS -d CONFIG_PAGE_OWNER
+#     (官方运行 config 实测 DEBUG_FS/PAGE_OWNER 均 not set; 全量合并 holi_debug.
+#     config 反而会带入 CMA_DEBUGFS 等官方没有的 debug=y 与 LOCALVERSION
+#     =-qgki-debug, 故采用与官方 config 完全一致的等值做法)
+#   - 官方同款工具链参数: LD=ld.lld (LD_IS_LLD) + llvm-nm/llvm-objcopy
+#     (TOOLS_SUPPORT_RELR) + LLVM_IAS -> LTO_CLANG/THINLTO/CFI_CLANG/
+#     CFI_CLANG_SHADOW/RELR/COMPAT_VDSO 全部解锁, 与官方 config 一致
+#   - 不集成 KSU/SUSFS, 不加假 __cfi_slowpath, 不注释 PREL32 select
+#   - 版本串 = 官方一致: LOCALVERSION=-qgki + LOCALVERSION_AUTO=y + 干净 git
+#     树 (无 patch, 无 tag) -> setlocalversion 输出 -g84e7d691ee3a
+#
+# 用法: Actions -> D0 Baseline -> Run workflow (los_date 填 nightly 日期)
+# 产物 artifact: d0-baseline-official-boot (new_boot.img + SHA256SUMS + config)
+# ============================================================
+name: D0 Baseline (Official-parity boot)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '内核分支 (默认 lineage-23.2)'
+        required: true
+        type: string
+        default: 'lineage-23.2'
+      los_version:
+        description: 'LineageOS 版本'
+        required: true
+        type: string
+        default: '23.2'
+      los_date:
+        description: 'LineageOS nightly 日期 YYYYMMDD'
+        required: true
+        type: string
+        default: '20261005'
+
+env:
+  DEVICE: 'oscar'
+  KERNEL_COMMIT: '84e7d691ee3a094de68628c488847a4dd632e7eb'
+  CLANG_VER: 'clang-r563880c'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git make gcc flex bison bc cpio lz4 xz-utils \
+            libssl-dev libncurses-dev libelf-dev unzip zip python3 \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+          df -h "$GITHUB_WORKSPACE"
+          FREE_KB=$(df --output=avail -k "$GITHUB_WORKSPACE" | tail -1)
+          if [ "$FREE_KB" -lt 25000000 ]; then
+            echo "!! 磁盘剩余 ${FREE_KB}KB < 25GB, D0 可能放不下 clang21+内核+构建物"; exit 1
+          fi
+
+      - name: 下载内核源码 + 锁定官方 commit
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.kernel_branch }}" \
+            https://github.com/LineageOS/android_kernel_realme_sm6375 kernel
+          cd kernel
+          # depth-1 + branch tip 即官方 commit; 强制 checkout 全量 hash (防漂移)
+          git checkout -f ${{ env.KERNEL_COMMIT }}
+          echo "内核 commit: $(git rev-parse --short HEAD)"
+          # 版本串需要 setlocalversion 输出 -g<12hex>: 无 tag -> 与官方一致
+          git tag | wc -l
+
+      - name: 下载官方 prebuilt clang21 (clang-r563880c)
+        run: |
+          # AOSP prebuilts 的 main 分支已移除 clang-r563880c 目录。
+          # commit f8439f0628d799092dd07df440a6334cab28939c 的 tree 仍含该目录
+          # (AndroidVersion.txt: 21.0.0 / based on r563880c —— 与官方 oscar nightly
+          #  Image 内 'Android (14054515,...based on r563880c) clang version 21.0.0'
+          #  完全一致; LOS 官方 sm8250 也是 Use Clang r563880c)。
+          # gitiles 路径历史 API 需登录, 故用固定 commit + blob:none 部分克隆 +
+          # sparse-checkout 单目录 (只拉该版本的 blob, 实测 3.7G)。
+          # ★ 顺序关键: 必须先 sparse-checkout set 再 checkout commit, 否则会把
+          #   整棵 prebuilts tree 全部 checkout (数十 GB)。
+          rm -rf clang-prebuilts && git clone --filter=blob:none --no-checkout --sparse \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilts
+          cd clang-prebuilts
+          git sparse-checkout init --cone
+          git sparse-checkout set ${{ env.CLANG_VER }}
+          git checkout -q f8439f0628d799092dd07df440a6334cab28939c
+          chmod +x ${{ env.CLANG_VER }}/bin/* 2>/dev/null || true
+          test -x ${{ env.CLANG_VER }}/bin/clang || { echo "!! clang 缺失"; exit 1; }
+          ${{ env.CLANG_VER }}/bin/clang --version | head -2
+          test -x ${{ env.CLANG_VER }}/bin/ld.lld || { echo "!! ld.lld 缺失"; exit 1; }
+          ls ${{ env.CLANG_VER }}/bin/ | grep -E "^(clang$|ld.lld$|llvm-(ar|nm|objcopy|strip)$)" | tr '\n' ' '; echo
+
+      - name: "配置内核 (官方等值: defconfig + LTO/CFI/LLD 全解锁)"
+        run: |
+          cd kernel
+          export PATH=$PWD/../clang-prebuilts/${{ env.CLANG_VER }}/bin:$PATH
+          # 官方 BoardConfigCommon.mk 把 vendor/debugfs.config 并入构建, 其内容即
+          # "-d CONFIG_PAGE_OWNER -d CONFIG_DEBUG_FS" (官方运行 config 实证两者均 off)。
+          # 全量合并 holi_debug.config 反而会带入 CMA_DEBUGFS 等官方没有的 debug=y,
+          # 故用等值 -d, 与官方 /proc/config.gz 零差异 (config_official.txt 已双向核对)
+          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy \
+            STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
+            KCFLAGS='-I. -Idrivers/usb/typec/tcpc' vendor/holi-qgki_defconfig
+          ./scripts/config -d DEBUG_FS -d PAGE_OWNER
+          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy \
+            STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
+            KCFLAGS='-I. -Idrivers/usb/typec/tcpc' olddefconfig
+          echo "--- 关键项断言 (官方 config_official.txt 对照) ---"
+          for k in CONFIG_LTO_CLANG CONFIG_THINLTO CONFIG_CFI_CLANG \
+            CONFIG_CFI_CLANG_SHADOW CONFIG_LD_IS_LLD CONFIG_RELR \
+            CONFIG_COMPAT_VDSO CONFIG_GENERIC_COMPAT_VDSO \
+            CONFIG_IKCONFIG CONFIG_IKCONFIG_PROC CONFIG_MODVERSIONS \
+            CONFIG_BLK_INLINE_ENCRYPTION CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK \
+            CONFIG_F2FS_FS CONFIG_F2FS_FS_XATTR CONFIG_F2FS_FS_SECURITY \
+            CONFIG_FS_ENCRYPTION CONFIG_FS_ENCRYPTION_ALGS \
+            CONFIG_FS_ENCRYPTION_INLINE_CRYPT CONFIG_DM_CRYPT \
+            CONFIG_CRYPTO_ECB CONFIG_CRYPTO_XTS; do
+            grep -q "^${k}=y" .config || { echo "!! ${k} 非 =y"; grep -E "^(# )?${k}=" .config || true; exit 1; }
+          done
+          for k in CONFIG_DEBUG_FS CONFIG_PAGE_OWNER; do
+            grep -q "^# ${k} is not set" .config || { echo "!! ${k} 应关闭"; exit 1; }
+          done
+          grep -q '^CONFIG_LOCALVERSION="-qgki"$' .config || { echo "!! LOCALVERSION 异常"; exit 1; }
+          grep -q '^CONFIG_LOCALVERSION_AUTO=y$' .config || { echo "!! LOCALVERSION_AUTO 应为 y (官方同款版本串机制)"; exit 1; }
+          echo "OK: 与官方 config 关键项一致 (LTO/CFI/LLD/RELR/COMPAT_VDSO/存储加密全解锁)"
+          grep -E "CONFIG_LTO_CLANG|CONFIG_THINLTO|CONFIG_CFI_CLANG|CONFIG_LD_IS_LLD|CONFIG_RELR|CONFIG_COMPAT_VDSO|CONFIG_LOCALVERSION" .config
+          cp .config ../kernel_config.txt
+
+      - name: 编译内核 (clang21 + LTO + CFI + LLD)
+        run: |
+          cd kernel
+          export PATH=$PWD/../clang-prebuilts/${{ env.CLANG_VER }}/bin:$PATH
+          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld NM=llvm-nm \
+            OBJCOPY=llvm-objcopy STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
+            KCFLAGS='-I. -Idrivers/usb/typec/tcpc' -j$(nproc)
+          ls -la arch/arm64/boot/Image vmlinux
+          echo "--- 内核版本 (期 5.4.302-qgki-g84e7d691ee3a, clang21, +lto) ---"
+          strings -a arch/arm64/boot/Image | grep -m1 "Linux version"
+          strings -a arch/arm64/boot/Image | grep -m1 "clang version 21"
+
+      - name: 下载官方 boot.img (los_date, 校验 sha256)
+        run: |
+          set -e
+          EXPECT_SHA=""
+          if curl -s --max-time 20 "https://download.lineageos.org/api/v2/devices/${DEVICE}/builds" -o los_builds.json; then
+            EXPECT_SHA=$(python3 -c "
+          import json
+          d = json.load(open('los_builds.json'))
+          date = '${{ github.event.inputs.los_date }}'
+          for b in d:
+              if b.get('date','').replace('-','') == date:
+                  for f in b.get('files',[]):
+                      if f.get('filename') == 'boot.img':
+                          print(f.get('sha256',''))
+          ")
+            rm -f los_builds.json
+            echo "官方 API 返回 boot.img sha256: $EXPECT_SHA"
+          else
+            echo "官方 API 不可用, 跳过 sha256 校验"
+          fi
+          for BOOT_URL in \
+            "https://mirrorbits.lineageos.org/full/${DEVICE}/${{ github.event.inputs.los_date }}/boot.img" \
+            "https://mirror.freedif.org/lineageos/full/${DEVICE}/${{ github.event.inputs.los_date }}/boot.img"; do
+            echo "尝试直链: $BOOT_URL"
+            HTTP=$(curl -sL -o boot.img -w '%{http_code}' --retry 3 "$BOOT_URL" || echo 000)
+            if [ "$HTTP" = "200" ] && [ -s boot.img ]; then
+              echo "直链下载成功: $(stat -c%s boot.img) bytes"
+              break
+            fi
+            rm -f boot.img
+          done
+          if [ -s boot.img ]; then
+            echo "boot.img 就绪 (直链)"
+          else
+            echo "直链均不可用, 改用 payload.bin 提取"
+            LOS_URL="https://mirrorbits.lineageos.org/full/${DEVICE}/${{ github.event.inputs.los_date }}/lineage-${{ github.event.inputs.los_version }}-${{ github.event.inputs.los_date }}-nightly-${DEVICE}-signed.zip"
+            curl -sL --retry 3 -o los.zip "$LOS_URL"
+            unzip -o los.zip payload.bin
+            rm -f los.zip
+            PDG_URL=$(curl -s https://api.github.com/repos/ssut/payload-dumper-go/releases/latest | python3 -c "import json,sys;d=json.load(sys.stdin);print([a['browser_download_url'] for a in d['assets'] if 'linux_amd64' in a['name']][0])")
+            curl -sL -o pdg.tar.gz "$PDG_URL"
+            tar -xzf pdg.tar.gz
+            rm -f pdg.tar.gz
+            ./payload-dumper-go -o . -p boot payload.bin
+            rm -f payload.bin
+          fi
+          python3 -c "
+          with open('boot.img','rb') as f:
+              assert f.read(8) == b'ANDROID!', 'boot.img magic 校验失败'
+          print('boot.img magic OK')
+          "
+          if [ -n "$EXPECT_SHA" ]; then
+            ACTUAL_SHA=$(sha256sum boot.img | cut -d' ' -f1)
+            echo "实际 sha256: $ACTUAL_SHA"
+            [ "$ACTUAL_SHA" = "$EXPECT_SHA" ] || { echo "!! sha256 不匹配"; exit 1; }
+            echo "sha256 校验通过"
+          fi
+          echo "原版 boot.img 就绪: $(stat -c%s boot.img) bytes"
+
+      - name: 解包原 boot + 打包 D0 boot (官方参数)
+        run: |
+          git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
+          python3 mkbootimg/unpack_bootimg.py --boot_img boot.img --out boot_split
+          ls boot_split/
+          OS_VER=$(cat boot_split/os_version 2>/dev/null || echo "16.0.0")
+          OS_PATCH=$(cat boot_split/os_patch_level 2>/dev/null || echo "2026-08")
+          HDR_VER=$(cat boot_split/header_version 2>/dev/null || echo "4")
+          echo "os_version=$OS_VER os_patch=$OS_PATCH header=$HDR_VER"
+          echo "官方内核大小: $(stat -c%s boot_split/kernel)"
+          echo "D0 内核大小:   $(stat -c%s kernel/arch/arm64/boot/Image)"
+          python3 mkbootimg/mkbootimg.py \
+            --kernel kernel/arch/arm64/boot/Image \
+            --ramdisk boot_split/ramdisk \
+            --cmdline "$(cat boot_split/cmdline)" \
+            --header_version $HDR_VER \
+            --os_version "$OS_VER" --os_patch_level "$OS_PATCH" \
+            -o new_boot.img
+          ls -la new_boot.img
+
+      - name: 验证产物 (官方工具链串 + 无 KSU 符号 + sha256)
+        run: |
+          python3 mkbootimg/unpack_bootimg.py --boot_img new_boot.img --out new_split
+          echo "新 boot 内核大小: $(stat -c%s new_split/kernel)"
+          echo "官方 boot 内核大小 (对照): $(stat -c%s boot_split/kernel)"
+          echo "--- 内核版本串 (应 5.4.302-qgki-g84e7d691ee3a) ---"
+          strings -a new_split/kernel | grep -m1 "Linux version"
+          echo "--- clang 版本串 (必须 21 且含官方 +pgo,+bolt,+lto,+mlgo) ---"
+          VER=$(strings -a new_split/kernel | grep -m1 "clang version 21")
+          echo "$VER"
+          echo "$VER" | grep -q "based on r563880c" || { echo "!! 非官方 r563880c prebuilt"; exit 1; }
+          echo "--- LTO/CFI 特征 (CONFIG_CC_VERSION_TEXT 带 +lto) ---"
+          strings -a new_split/kernel | grep -m1 "+pgo, +bolt, +lto, +mlgo" || { echo "!! 未见 +lto 特征"; exit 1; }
+          echo "--- 官方 Image 对照 (boot_split/kernel 应含相同串) ---"
+          strings -a boot_split/kernel | grep -m1 "Linux version"
+          strings -a boot_split/kernel | grep -m1 "clang version 21"
+          echo "--- 确认无 KSU/SUSFS/ksud 符号 (对 vmlinux 查符号表 + 双保险 strings) ---"
+          if [ -f kernel/vmlinux ]; then
+            if $PWD/clang-prebuilts/${{ env.CLANG_VER }}/bin/llvm-nm kernel/vmlinux 2>/dev/null | grep -icE "ksu_|ksud|kernelsu|susfs" | grep -qE "^0$"; then
+              echo "OK: vmlinux 符号表无 KSU/SUSFS"
+            else
+              echo "!! vmlinux 检测到 KSU/SUSFS 符号"; exit 1
+            fi
+          fi
+          if strings -a new_split/kernel | grep -qicE "kernelsu|ksud|susfs|KSU_"; then
+            echo "!! kernel Image 发现 KSU/SUSFS 字符串 (D0 应无)"; exit 1
+          fi
+          echo "OK: 无 KSU/SUSFS 痕迹"
+          sha256sum new_boot.img > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 上传产物 (D0)
+        uses: actions/upload-artifact@v4
+        with:
+          name: d0-baseline-official-boot
+          path: |
+            new_boot.img
+            SHA256SUMS.txt
+            kernel_config.txt
+            kernel/arch/arm64/boot/Image
+          if-no-files-found: error
