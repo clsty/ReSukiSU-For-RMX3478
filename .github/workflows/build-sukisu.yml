@@ -94,14 +94,23 @@ jobs:
       - name: 下载 AOSP Clang (sparse checkout, 只拉 clang-r510928)
         if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
-          # sparse + blob:none 只下载需要的 clang 版本目录 (~1.5GB)
-          git clone --depth 1 --filter=blob:none --sparse \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang
+          # 只下载需要的 clang 版本目录 (~1.5GB)。
+          # 注意: 不能用 --filter=blob:none (promisor partial clone) —— 实测
+          # googlesource 的 on-demand blob 拉取会超时, 导致 clang-r510928/bin
+          # 目录为空, 编译直接 clang: command not found (2026-10 修复)。
+          # 普通克隆 + --sparse 只检树对象, sparse set 时按需拉取条目, 更可靠。
+          git clone --depth 1 --sparse \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang || exit 1
           cd clang
           git sparse-checkout set clang-r510928
+          if [ ! -x clang-r510928/bin/clang ]; then
+            echo "!! clang 未检出完整, 重试一次 sparse-checkout"
+            git sparse-checkout set clang-r510928
+            test -x clang-r510928/bin/clang || { echo "!! clang 下载失败, 中止 (防止缓存坏目录)"; exit 1; }
+          fi
           clang-r510928/bin/clang --version | head -1
           # 诊断: 确认链接器情况
-          ls clang-r510928/bin/ | grep -E "^(clang|ld|lld)" | head || echo "!! bin 目录缺少预期工具"
+          ls clang-r510928/bin/ | grep -E "^(clang|ld|lld)" | head
           # 兜底: 安装系统 lld (提供 /usr/bin/ld.lld)
           sudo apt-get install -y lld || true
 
