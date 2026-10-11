@@ -606,6 +606,19 @@ jobs:
           #   只编 defconfig 会得到 DEBUG_FS=y/PAGE_OWNER=y, 与官方 config 不一致
           #   (dmesg 实证 2026-08: modversions CRC 校验失败, vendor 模块全拒)。
           ./scripts/config -d DEBUG_FS -d PAGE_OWNER
+          # ★ 官方 config 关键项钉死 (对照设备实测 config_official.txt, 防 defconfig 漂移):
+          #   /data = f2fs + fscrypt inlinecrypt 硬件内联加密 (官方 mount: ...inlinecrypt,
+          #   /dev/block/dm-42)。BLK_INLINE_ENCRYPTION/F2FS/FS_ENCRYPTION_INLINE_CRYPT/
+          #   DM_CRYPT/crypto 任一缺失或变 m, vold init_user0 (用户0数据初始化) 必失败。
+          #   显式 -e/-d, 不依赖 defconfig 默认 (2026-10-11 设备实证 init_user0_failed 排查)。
+          ./scripts/config \
+            -e BLK_INLINE_ENCRYPTION -e BLK_INLINE_ENCRYPTION_FALLBACK \
+            -e F2FS_FS -e F2FS_STAT_FS -e F2FS_FS_XATTR \
+            -e F2FS_FS_POSIX_ACL -e F2FS_FS_SECURITY \
+            -e FS_ENCRYPTION -e FS_ENCRYPTION_ALGS -e FS_ENCRYPTION_INLINE_CRYPT \
+            -e DM_CRYPT -e DM_DEFAULT_KEY -e BLK_DEV_DM \
+            -e CRYPTO_ECB -e CRYPTO_XTS -e CRYPTO_AES -e CRYPTO_SHA512 \
+            -d F2FS_CHECK_FS -d F2FS_FAULT_INJECTION
           # 开启 ReSukiSU + SUSFS 全部 9 个子开关 (SUS_PATH/SUS_MOUNT/SUS_KSTAT/
           # SPOOF_UNAME/ENABLE_LOG/HIDE_KSU_SUSFS_SYMBOLS/SPOOF_CMDLINE_OR_BOOTCONFIG/
           # OPEN_REDIRECT/SUS_MAP)。ReSukiSU Kconfig: KSU_SUSFS 依赖
@@ -641,6 +654,26 @@ jobs:
           echo "--- 配置验证 ---"
           grep -E "CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KSU_SUSFS|CONFIG_LOCALVERSION|CONFIG_DEBUG_FS|CONFIG_PAGE_OWNER|CONFIG_MODVERSIONS" .config \
             || echo "!! 未找到 KSU/SUSFS 配置，请检查 ReSukiSU 集成是否成功"
+          # ★ 存储/加密/文件系统关键项 =y 断言 (对照官方 config_official.txt)
+          CFG_FAIL=0
+          for k in \
+            CONFIG_BLK_INLINE_ENCRYPTION CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK \
+            CONFIG_F2FS_FS CONFIG_F2FS_STAT_FS CONFIG_F2FS_FS_XATTR \
+            CONFIG_F2FS_FS_POSIX_ACL CONFIG_F2FS_FS_SECURITY \
+            CONFIG_FS_ENCRYPTION CONFIG_FS_ENCRYPTION_ALGS CONFIG_FS_ENCRYPTION_INLINE_CRYPT \
+            CONFIG_DM_CRYPT CONFIG_DM_DEFAULT_KEY CONFIG_BLK_DEV_DM \
+            CONFIG_CRYPTO_ECB CONFIG_CRYPTO_XTS CONFIG_CRYPTO_AES CONFIG_CRYPTO_SHA512 \
+            CONFIG_IKCONFIG CONFIG_IKCONFIG_PROC CONFIG_MODVERSIONS; do
+            grep -q "^${k}=y" .config || { echo "!! ${k} 应为 =y: 实际 $(grep -E "^(# )?${k}=" .config | head -1 | sed 's/^/  /' || echo 缺失)"; CFG_FAIL=1; }
+          done
+          for k in CONFIG_DEBUG_FS CONFIG_PAGE_OWNER CONFIG_F2FS_CHECK_FS CONFIG_F2FS_FAULT_INJECTION; do
+            grep -q "^# ${k} is not set" .config || { echo "!! ${k} 应为关闭"; CFG_FAIL=1; }
+          done
+          [ $CFG_FAIL -eq 0 ] && echo "OK: 存储/加密/文件系统项与官方 config 一致 (f2fs+fscrypt inlinecrypt 就绪)" \
+            || { echo "!! config 关键项不一致, 中止"; exit 1; }
+          # 完整 .config 导出到工作区 (上传 artifact), 供 boot 失败时逐项比对官方配置
+          cp .config ../kernel_config.txt
+          echo "kernel_config.txt 已导出: $(wc -l < ../kernel_config.txt) 行"
           # ★ PREL32 必须为关闭 (80_ patch 注释了 select): 官方 LTO 内核无 PREL32,
           #   模块 __ksymtab 为 24B/条目; 若 PREL32=y (12B) 则模块导出符号名错位
           #   (kallsyms 大量 $x 乱码), 模块间符号引用全断 (WiFi/蓝牙/音频挂)。
@@ -815,5 +848,5 @@ jobs:
             new_boot.img
             SHA256SUMS.txt
             kernel/arch/arm64/boot/Image
-            kernel/.config
+            kernel_config.txt
           if-no-files-found: error
