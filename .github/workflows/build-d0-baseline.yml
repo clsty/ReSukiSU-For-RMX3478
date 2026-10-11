@@ -9,16 +9,17 @@
 # ★ 双模式 (workflow_dispatch 的 mode 输入):
 #   - official (默认): D0 干净基线, 官方配方 (clang21 + LTO/CFI/LLD + O=), 无 KSU,
 #     artifact = d0-baseline-official-boot。设备实测 ✅ 正常开机。
-#   - ksu: E1 —— 同一官方配方基底 + ReSukiSU/KSU 集成, artifact = resukisu-official-lto。
+#   - ksu: E1/E2 —— 同一官方配方基底 + ReSukiSU/SUSFS 集成。
 #     E0 判别实验 (2026-10-11 设备实测) 已定论: 断电关机根因是"clang18 非 LTO +
 #     假 __cfi_slowpath + 关 PREL32"失败配方本身, 与 KSU/SUSFS 补丁无关; 因此在
 #     已验证可开机的官方配方上构建 KSU。(失败配方对症: 不打 60_/70_/80_ hack,
 #     不做 TRACE_INCLUDE/tcpc/oplus 修复 —— O= + clang21 天然无需)。
-#   ★ E1 现阶段 = KSU-only-on-official: SUSFS 未启用 —— 见 config 步骤注释
-#     (本仓库缺 SUSFS 官方 10_enable_susfs_for_ksu.patch 的 Kconfig 定义段, 且
-#     50_ patch 引用的 ksu_* 符号与 ReSukiSU v4.1.0 命名不符, 真启用会链接失败;
-#     历史 KSU v3 产物实际也是 KSU-only, 从未含 SUSFS 代码)。SUSFS 需符号适配
-#     后追加。
+#   ★ E1 (2026-10) = KSU-only-on-official: v4.1.0 无 SUSFS 符号, SUSFS 未启用,
+#     artifact = resukisu-official-lto, 设备实测 ✅ 正常开机 + root。
+#   ★ E2 = KSU + SUSFS 完整启用: 升级 ReSukiSU 至 v4.2.0-rc1 (自带 SUSFS Kconfig
+#     全段 + ksu_is_* static_key 符号, 与 50_ patch 完全匹配), 9 项 SUSFS 功能全开,
+#     artifact = resukisu-susfs。KSU_MANUAL_SU 选项已并入 sucompat (默认开启),
+#     manager 需换装 40856 (KSU_APP_PROFILE_VER=4)。
 #
 # 与官方对齐点 (对照设备 /proc/config.gz = config_official.txt):
 #   - 内核源码 commit 84e7d691ee3a (lineage-23.2 分支 tip, 与已刷系统一致)
@@ -66,7 +67,7 @@ on:
         type: string
         default: '20261005'
       mode:
-        description: '构建模式: official = D0 官方配方干净基线(默认); ksu = 官方配方 + ReSukiSU/SUSFS 集成 (E0 判别后新方向)'
+        description: '构建模式: official = D0 官方配方干净基线(默认); ksu = 官方配方 + ReSukiSU v4.2.0-rc1 + SUSFS 全功能 (E2)'
         required: true
         type: choice
         options:
@@ -143,14 +144,14 @@ jobs:
       #   无 TRACE_INCLUDE/tcpc/oplus 修复 (O= + clang21 天然解决)。
       #   保留的是 "KSU 对 5.4 的 API 适配" (task_work/sepolicy/rules/pkg_observer/
       #   path_umount/SUSFS 5.4 patch)。
-      - name: 集成 ReSukiSU (锁定 v4.1.0 + symlink)
+      - name: 集成 ReSukiSU (锁定 v4.2.0-rc1 + symlink)
         if: env.MODE == 'ksu'
         run: |
           cd kernel
           rm -rf KernelSU
           git clone https://github.com/ReSukiSU/ReSukiSU KernelSU
           cd KernelSU
-          git checkout v4.1.0
+          git checkout v4.2.0-rc1
           echo "ReSukiSU commit: $(git log --oneline -1)"
           ls kernel/Kbuild kernel/Kconfig kernel/selinux/selinux.c && echo "结构正确 (kernel/ 目录)"
           cd ..
@@ -168,100 +169,55 @@ jobs:
             git -C KernelSU branch miuix HEAD
           fi
           echo "miuix 分支 commit 数: $(git -C KernelSU rev-list --count miuix)"
+          # ============ v4.2.0-rc1: 5.4 兼容绝大多数已由上游内置 ============
+          # kernel_compat.mk 自动检测 oscar 5.4 树并塞 ccflags:
+          #   TWA_RESUME fallback (compat/kernel_compat.h <5.7 -> true)
+          #   put_seccomp_filter (kernel_compat.mk 检测无此符号 -> OPTIONAL_SECCOMP_FILTER_RELEASE,
+          #                       app_profile.c 的 5.9-/分支自动走 memcpy fake 路径)
+          #   pgtable (sucompat.c: <5.8 -> asm/pgtable.h)
+          #   selinux_state (kernel_compat.mk 检测 security.h 有 struct selinux_state
+          #                  -> KSU_COMPAT_HAS_SELINUX_STATE; rules.c get_policydb
+          #                  的 KSU_COMPAT_USE_SELINUX_STATE 分支)
+          #   filename_trans (<5.9 走 hashtab_search(&db->filename_trans))
+          #   security_add_hooks (5.4 命名, 5.10+ 才改 lsm_add_hook)
+          #   minmax.h/overflow.h (检测 wildcard)
+          #   5.4 走 hook/lsm_hooks.o 而非 pkg_observer (Kbuild 的 $VERSION -lt 6 分支),
+          #   规避 pkg_observer 的新式 fsnotify 签名 (那是 6.8+ 才用的)
+          #
+          # 仍需手动处理的 (rc1 未覆盖 / 与 oscar 5.4 的残余差异):
           python3 - <<'PYEOF'
           import glob, re
-          files = glob.glob('KernelSU/kernel/*.c') + glob.glob('KernelSU/kernel/selinux/*.c')
-          for f in files:
-              s = open(f, encoding='utf-8').read()
-              orig = s
-              s = s.replace('TWA_RESUME', 'true')
-              s = s.replace('put_seccomp_filter(tsk);', 'seccomp_filter_release(tsk);')
-              s = s.replace('#include <linux/pgtable.h>\n', '')
-              if f.endswith('pkg_observer.c'):
-                  m = re.search(r'static int ksu_handle_inode_event\([^)]*\)', s, re.S)
-                  assert m, 'fsnotify sig not found in pkg_observer.c'
-                  new_sig = ('static int ksu_handle_event(struct fsnotify_group *group,\n'
-                             '                  struct inode *inode, u32 mask, const void *data,\n'
-                             '                  int data_type, const struct qstr *file_name, u32 cookie,\n'
-                             '                  struct fsnotify_iter_info *iter_info)')
-                  s = s[:m.start()] + new_sig + s[m.end():]
-                  s = s.replace('.handle_inode_event = ksu_handle_inode_event,',
-                                '.handle_event = ksu_handle_event,')
-                  assert '.handle_inode_event' not in s, 'leftover handle_inode_event'
-                  print('patched: pkg_observer.c (fsnotify handle_event 5.4)')
-              if f.endswith('sepolicy.c'):
-                  m = re.search(r'    struct filename_trans_key key;\n', s)
-                  assert m, 'sepolicy key marker not found'
-                  s = (s[:m.start()]
-                       + '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)\n'
-                       + s[m.start():])
-                  tail = ('    db->compat_filename_trans_count++;\n'
-                          '    return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;\n')
-                  assert tail in s, 'sepolicy tail marker not found'
-                  s = s.replace(tail, tail + (
-                      '#else\n'
-                      '    /* oscar (sm6375) 5.4 GKI 1.0: 旧式 filename_trans (5.8-) */\n'
-                      '    struct filename_trans key;\n'
-                      '    key.stype = src->value;\n'
-                      '    key.ttype = tgt->value;\n'
-                      '    key.tclass = cls->value;\n'
-                      '    key.name = (char *)o;\n'
-                      '\n'
-                      '    struct filename_trans_datum *trans =\n'
-                      '        hashtab_search(db->filename_trans, &key);\n'
-                      '    if (trans) {\n'
-                      '        trans->otype = def->value;\n'
-                      '    } else {\n'
-                      '        trans = (struct filename_trans_datum *)kcalloc(1, sizeof(*trans),\n'
-                      '                                   GFP_ATOMIC);\n'
-                      '        trans->otype = def->value;\n'
-                      '        struct filename_trans *new_key =\n'
-                      '            (struct filename_trans *)kzalloc(sizeof(*new_key), GFP_ATOMIC);\n'
-                      '        *new_key = key;\n'
-                      '        new_key->name = kstrdup(key.name, GFP_ATOMIC);\n'
-                      '        hashtab_insert(db->filename_trans, new_key, trans);\n'
-                      '        ebitmap_set_bit(&db->filename_trans_ttypes, key.ttype, 1);\n'
-                      '    }\n'
-                      '    return true;\n'
-                      '#endif\n'), 1)
-                  print('patched: selinux/sepolicy.c (add_filename_trans 5.4 分叉)')
-              if f.endswith('rules.c'):
-                  marker = ('    struct selinux_policy *policy = selinux_state.policy;\n'
-                            '    db = &policy->policydb;\n')
-                  assert marker in s, 'rules get_policydb marker not found'
-                  s = s.replace(marker, (
-                      '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n'
-                      '    struct selinux_policy *policy = selinux_state.policy;\n'
-                      '    db = &policy->policydb;\n'
-                      '#else\n'
-                      '    db = &selinux_state.ss->policydb;\n'
-                      '#endif\n'), 1)
-                  print('patched: selinux/rules.c (get_policydb 5.4: ss->policydb)')
-              if 'put_task_struct' in s and '#include <linux/sched/task.h>' not in s:
-                  m = re.search(r'(#include <linux/[^\n]+>)', s)
-                  if m:
-                      ins = m.group(1) + '\n#include <linux/sched/task.h>'
-                      s = s[:m.start()] + ins + s[m.end():]
-              if s != orig:
-                  open(f, 'w', encoding='utf-8').write(s)
-                  print('patched:', f)
+          # 1) Kbuild KSU_VERSION fallback (无 miuix 历史时 expr 为空 -> 兜底 13000)
           kb = 'KernelSU/kernel/Kbuild'
           ks = open(kb, encoding='utf-8').read()
           if '|| echo 13000' not in ks:
-              assert 'KSU_VERSION := $(shell expr 40000 + $(KSU_LOCAL_VERSION) - 2815)' in ks, 'Kbuild expr line not found'
-              ks = ks.replace(
-                  'KSU_VERSION := $(shell expr 40000 + $(KSU_LOCAL_VERSION) - 2815)',
-                  'KSU_VERSION := $(shell expr 40000 + $(KSU_LOCAL_VERSION) - 2815 2>/dev/null || echo 13000)')
+              m = re.search(r'KSU_VERSION := \$\$\(shell expr ([^\n]+)\)', ks)
+              assert m, 'Kbuild KSU_VERSION expr line not found'
+              old = m.group(0)
+              new = old[:-1] + ' 2>/dev/null || echo 13000)'
+              ks = ks.replace(old, new)
               open(kb, 'w', encoding='utf-8').write(ks)
               print('patched: KernelSU/kernel/Kbuild (KSU_VERSION fallback 13000)')
           else:
               print('Kbuild KSU_VERSION fallback already present')
+          # 2) sched/task.h include: put_task_struct 在 5.4 位于 linux/sched/task.h
+          #    (rc1 若只 include linux/sched.h 则编译失败)
+          files = glob.glob('KernelSU/kernel/**/*.c', recursive=True)
+          for f in files:
+              s = open(f, encoding='utf-8').read()
+              orig = s
+              if 'put_task_struct' in s and '#include <linux/sched/task.h>' not in s:
+                  m = re.search(r'(#include <linux/[^\n]+>)', s)
+                  if m:
+                      s = s[:m.start()] + m.group(1) + '\n#include <linux/sched/task.h>' + s[m.end():]
+              if s != orig:
+                  open(f, 'w', encoding='utf-8').write(s)
+                  print('patched:', f, '(sched/task.h)')
           PYEOF
           echo "--- 验证 ---"
-          grep -rn "TWA_RESUME" KernelSU/kernel/ | grep -v Binary || echo "OK: 无 TWA_RESUME 残留"
-          grep -rn "put_seccomp_filter" KernelSU/kernel/ | grep -v Binary || echo "OK: 无 put_seccomp_filter 残留 (改用 seccomp_filter_release)"
-          grep -l "put_task_struct" KernelSU/kernel/*.c | while read f; do grep -q "sched/task.h" "$f" || { echo "!! $f 缺 sched/task.h"; exit 1; }; done
+          grep -rln "put_task_struct" KernelSU/kernel/ | while read f; do grep -q "sched/task.h" "$f" || { echo "!! $f 缺 sched/task.h"; exit 1; }; done
           echo "OK: put_task_struct 文件均已 include sched/task.h"
+          echo "OK: TWA_RESUME/put_seccomp_filter/pgtable 由 rc1 kernel_compat 自适配, 无需手动"
 
       - name: 应用 SUSFS 5.4 patch
         if: env.MODE == 'ksu'
@@ -339,20 +295,31 @@ jobs:
             STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
             KCFLAGS='-I. -Idrivers/usb/typec/tcpc' vendor/holi-qgki_defconfig
           ./scripts/config --file ${{ env.KERNEL_OUT }}/.config -d DEBUG_FS -d PAGE_OWNER
-          # ★ mode=ksu: 开启 ReKSU 本体开关。KALLSYMS/KALLSYMS_ALL 官方 config 即 =y。
-          #   ★ 重要: SUSFS 未在此启用 —— 本仓库只有 50_add_susfs_in_kernel-5.4.patch
-          #   (内核侧 #ifdef 代码), 但缺少 SUSFS 官方 10_enable_susfs_for_ksu.patch 的
-          #   Kconfig 定义段 (CONFIG_KSU_SUSFS), 且 50_ patch 引用的 ksu_* 符号与
-          #   ReSukiSU v4.1.0 (is_ksu_domain/ksu_input_hook) 不匹配, 真启用会链接失败。
-          #   因此 E1 先构建 KSU-only-on-official (判别官方配方上 KSU 能否开机),
-          #   SUSFS 需单独符号适配后再加 (见报告)。
+          # ★ mode=ksu (E2): 启用 KSU + SUSFS 全功能。ReSukiSU v4.2.0-rc1 的
+          #   kernel/Kconfig 自带完整 SUSFS 段 (KSU_SUSFS + 9 子开关), 无需补丁;
+          #   50_ patch (内核侧 #ifdef + inline_hook_check) 与 rc1 符号完全匹配
+          #   (DEFINE_STATIC_KEY_TRUE 定义 ksu_is_* static_key)。
+          #   ★ rc1 已移除 KSU_MANUAL_SU 选项 (manual_su 并入 feature/sucompat.c
+          #     无条件编译 + ksu_su_compat_enabled static_key 默认开) —— 不再 -e。
+          #   ★ Hook 方法三选一 (TRACEPOINT/MANUAL_HOOK/SUSFS), default=TRACEPOINT
+          #     (仅 GKI2 5.10+), 必须显式 -e KSU_SUSFS, 否则 5.4 走 TRACEPOINT 报错。
           #   LOCALVERSION: 集成 patch 弄脏 git 树后 AUTO=y 会自动追加 -dirty 进
-          #   vermagic (vendor 模块拒载), 故 ksu 模式必须 -d AUTO + 写死官方版本串
-          #   (与 build-sukisu 配方一致)。official 模式保持官方 AUTO=y + -qgki。
+          #   vermagic (vendor 模块拒载), 故 ksu 模式必须 -d AUTO + 写死官方版本串。
           if [ "$MODE" = "ksu" ]; then
-            touch .scmversion   # 空文件: 抑制 setlocalversion 的 git 附加后缀 (防 '+' 混入 vermagic, 与 KSU v3 配方同机制)
+            touch .scmversion   # 空文件: 抑制 setlocalversion 的 git 附加后缀 (防 '+' 混入 vermagic)
             ./scripts/config --file ${{ env.KERNEL_OUT }}/.config \
               -e KSU -e KALLSYMS -e KALLSYMS_ALL \
+              -d KSU_TRACEPOINT_HOOK -d KSU_MANUAL_HOOK \
+              -e KSU_SUSFS \
+              -e KSU_SUSFS_SUS_PATH \
+              -e KSU_SUSFS_SUS_MOUNT \
+              -e KSU_SUSFS_SUS_KSTAT \
+              -e KSU_SUSFS_SPOOF_UNAME \
+              -d KSU_SUSFS_ENABLE_LOG \
+              -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              -e KSU_SUSFS_OPEN_REDIRECT \
+              -e KSU_SUSFS_SUS_MAP \
               -d CONFIG_LOCALVERSION_AUTO \
               --set-str CONFIG_LOCALVERSION "-qgki-g84e7d691ee3a" || true
           fi
@@ -384,21 +351,28 @@ jobs:
             grep -q '^CONFIG_LOCALVERSION="-qgki-g84e7d691ee3a"$' ${{ env.KERNEL_OUT }}/.config || { echo "!! ksu LOCALVERSION 未写死官方串"; exit 1; }
             grep -q '^# CONFIG_LOCALVERSION_AUTO is not set' ${{ env.KERNEL_OUT }}/.config || { echo "!! ksu 模式 LOCALVERSION_AUTO 应为关 (防 -dirty)"; exit 1; }
           fi
-          # ★ ksu 模式: KSU 开关必须已生效 (Kconfig 来自 KernelSU symlink 的 kernel/Kconfig)
+          # ★ ksu 模式 (E2): KSU + SUSFS 全部开关必须已生效
           if [ "$MODE" = "ksu" ]; then
-            for k in CONFIG_KSU CONFIG_KSU_MANUAL_SU; do
+            for k in CONFIG_KSU \
+              CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH \
+              CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT \
+              CONFIG_KSU_SUSFS_SPOOF_UNAME \
+              CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              CONFIG_KSU_SUSFS_OPEN_REDIRECT CONFIG_KSU_SUSFS_SUS_MAP; do
               grep -q "^${k}=y" ${{ env.KERNEL_OUT }}/.config || { echo "!! ${k} 非 =y (KSU Kconfig 未生效?)"; grep -E "^(# )?${k}=" ${{ env.KERNEL_OUT }}/.config || true; exit 1; }
             done
-            if grep -q "^CONFIG_KSU_SUSFS=y" ${{ env.KERNEL_OUT }}/.config; then
-              echo "!! 意外: CONFIG_KSU_SUSFS=y (SUSFS 未适配不应启用)"; exit 1
+            # Hook 方法单选: KSU_TRACEPOINT_HOOK/KSU_MANUAL_HOOK 必须不选 (走 SUSFS)
+            if grep -qE "^CONFIG_KSU_(TRACEPOINT_HOOK|MANUAL_HOOK)=y" ${{ env.KERNEL_OUT }}/.config; then
+              echo "!! 意外: TRACEPOINT/MANUAL_HOOK 被选中 (应走 SUSFS)"; exit 1
             fi
-            echo "OK: KSU 本体开关已生效 (CONFIG_KSU=y; SUSFS 保持未启用)"
+            echo "OK: KSU + SUSFS 全开关生效 (E2)"
           fi
           echo "OK: 与官方 config 关键项一致 (LTO/CFI/LLD/RELR/COMPAT_VDSO/存储加密全解锁)"
           grep -E "CONFIG_LTO_CLANG|CONFIG_THINLTO|CONFIG_CFI_CLANG|CONFIG_LD_IS_LLD|CONFIG_RELR|CONFIG_COMPAT_VDSO|CONFIG_LOCALVERSION" ${{ env.KERNEL_OUT }}/.config
           cp ${{ env.KERNEL_OUT }}/.config ../kernel_config.txt
 
-      - name: 恢复 ccache (E1/KSU 迭代加速, key 区分 mode)
+      - name: 恢复 ccache (E2/KSU 迭代加速, key 区分 mode)
         id: cache-ccache
         if: env.MODE == 'ksu'
         uses: actions/cache/restore@v6
@@ -412,13 +386,12 @@ jobs:
         run: |
           cd kernel
           export PATH=$PWD/../clang-prebuilts/${{ env.CLANG_VER }}/bin:$PATH
-          # -DKSU_COMPAT_HAS_SELINUX_STATE: 5.4 高通 selinux_state 无 GKI 字段,
-          # 该宏触发 ReSukiSU selinux.c 的 5.4 兼容分支 (selinux_hide fake_state);
-          # 仅 ksu 模式需要 (official 无 KSU 源码, 加宏无意义)。
+          # E2: rc1 kernel_compat.mk 自动检测 5.4 树并注入所需 ccflags
+          #   (KSU_COMPAT_HAS_SELINUX_STATE / KSU_COMPAT_USE_SELINUX_STATE /
+          #    OPTIONAL_SECCOMP_FILTER_RELEASE 等), 无需手动 KCFLAGS 宏。
           KFLAGS_LSU=""
           MAKE_CC="clang"
           if [ "$MODE" = "ksu" ]; then
-            KFLAGS_LSU=" -DKSU_COMPAT_HAS_SELINUX_STATE"
             export CCACHE_DIR=$HOME/.ccache
             ccache -M 2G
             MAKE_CC="ccache clang"
@@ -542,23 +515,25 @@ jobs:
           echo "--- 官方 Image 对照 (boot_split/kernel 应含相同串) ---"
           strings -a boot_split/kernel | grep -m1 "Linux version"
           strings -a boot_split/kernel | grep -m1 "clang version 21"
-          echo "--- KSU 符号断言 (E1 = KSU-only-on-official; SUSFS 未启用) ---"
+          echo "--- KSU + SUSFS 符号断言 (E2 = KSU+SUSFS 完整) ---"
           if [ "$MODE" = "ksu" ]; then
-            # E1: 官方配方 + KSU 集成 -> 必须有 KSU 痕迹; 且不支持 SUSFS 符号
-            # (SUSFS 的 Kconfig 定义缺失 + 50_ patch 符号与 ReSukiSU v4.1.0 不匹配,
-            # 见 config 步骤注释; 真启用会链接失败。故只验证 KSU 本体)
+            # E2: 官方配方 + KSU + SUSFS -> 必须有 KSU 痕迹, 且必须检测到 SUSFS 符号
             KSU_HIT=0
+            SUSFS_NM=0
             if [ -f kernel/${{ env.KERNEL_OUT }}/vmlinux ]; then
               KSU_HIT=$($PWD/clang-prebuilts/${{ env.CLANG_VER }}/bin/llvm-nm kernel/${{ env.KERNEL_OUT }}/vmlinux 2>/dev/null | grep -icE "kernelsu|ksud|ksu_init|ksu_core" || true)
               echo "vmlinux 符号表 KSU 匹配: $KSU_HIT"
+              # SUSFS 符号: vmlinux 符号表搜 susfs_inode/susfs_rename/susp_ 等 (fs/susfs.c 编入才有)
+              SUSFS_NM=$($PWD/clang-prebuilts/${{ env.CLANG_VER }}/bin/llvm-nm kernel/${{ env.KERNEL_OUT }}/vmlinux 2>/dev/null | grep -icE "susfs|susp_" || true)
+              echo "vmlinux 符号表 SUSFS 匹配: $SUSFS_NM"
             fi
             STR_HIT=$(strings -a new_split/kernel | grep -icE "kernelsu|ksud|/data/adb|KernelSU" || true)
             echo "kernel Image KSU 字符串匹配: $STR_HIT"
+            SUSFS_STR=$(strings -a new_split/kernel | grep -icE "susfs|SUSFS" || true)
+            echo "kernel Image SUSFS 字符串匹配: $SUSFS_STR"
             [ "$STR_HIT" -gt 0 ] || { echo "!! ksu 模式未检测到 KSU 符号"; exit 1; }
-            if strings -a new_split/kernel | grep -qicE "susfs|SUSFS"; then
-              echo "!! E1 不应含 SUSFS 符号 (SUSFS 未启用, 50_ patch 全 #ifdef off)"; exit 1
-            fi
-            echo "OK: KSU 已集成到官方配方内核, SUSFS 未启用 (E1)"
+            [ "$SUSFS_NM" -gt 0 ] || [ "$SUSFS_STR" -gt 0 ] || { echo "!! E2 未检测到 SUSFS 符号 (fs/susfs.c 未编入?)"; exit 1; }
+            echo "OK: KSU + SUSFS 已集成到官方配方内核 (E2)"
           else
             # D0: 必须无 KSU/SUSFS
             if [ -f kernel/${{ env.KERNEL_OUT }}/vmlinux ]; then
@@ -576,7 +551,7 @@ jobs:
           sha256sum new_boot.img > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: 保存 ccache (E1/KSU 构建成功才更新, 供下次迭代加速)
+      - name: 保存 ccache (E2/KSU 构建成功才更新, 供下次迭代加速)
         if: env.MODE == 'ksu'
         uses: actions/cache/save@v6
         with:
@@ -586,7 +561,7 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.MODE == 'ksu' && 'resukisu-official-lto' || 'd0-baseline-official-boot' }}
+          name: ${{ env.MODE == 'ksu' && 'resukisu-susfs' || 'd0-baseline-official-boot' }}
           path: |
             new_boot.img
             SHA256SUMS.txt
