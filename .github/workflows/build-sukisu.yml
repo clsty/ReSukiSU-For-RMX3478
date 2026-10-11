@@ -194,6 +194,18 @@ jobs:
       - name: 修复 ReSukiSU 的 5.4 (sm6375) task_work API 兼容
         run: |
           cd kernel
+          # 4.45.0) KSU_VERSION 兜底: ReSukiSU/ReSukiSU 仓库没有 miuix 本地分支,
+          #   KernelSU/kernel/Kbuild 里 $(git rev-list --count miuix) 为空
+          #   -> KSU_VERSION 空 -> ccflags '-DKSU_VERSION=' 空宏 ->
+          #   supercalls.c:91 '{.version = KERNEL_SU_VERSION, .flags = 0}'
+          #   展开成 '{.version = , .flags = 0}' 报 "expected expression"。
+          #   (实际报错: Run#9 '-- SukiSU-Ultra version (local .git): ' 为空)
+          # 修复 a: 补建 miuix 本地分支指向 HEAD, 让 rev-list 有真实 commit 数;
+          # 修复 b: (见下方 python) Kbuild 的 KSU_VERSION 计算加 || echo 13000 兜底。
+          if ! git -C KernelSU rev-parse --verify --quiet miuix >/dev/null; then
+            git -C KernelSU branch miuix HEAD
+          fi
+          echo "miuix 分支 commit 数: $(git -C KernelSU rev-list --count miuix)"
           python3 - <<'PYEOF'
           import glob, re
           # 直接用真实路径 (drivers/kernelsu 是指向 KernelSU/kernel 的 symlink)
@@ -250,6 +262,19 @@ jobs:
               if s != orig:
                   open(f, 'w', encoding='utf-8').write(s)
                   print('patched:', f)
+          # 4.45.0b) Kbuild 兜底: KSU_VERSION 计算失败(空)时回落 13000 (与上游 fallback 一致),
+          #   防止 ccflags '-DKSU_VERSION=' 空宏导致 supercalls.c:91 expected expression。
+          kb = 'KernelSU/kernel/Kbuild'
+          ks = open(kb, encoding='utf-8').read()
+          if '|| echo 13000' not in ks:
+              assert 'KSU_VERSION := $(shell expr 40000 + $(KSU_LOCAL_VERSION) - 2815)' in ks, 'Kbuild expr line not found'
+              ks = ks.replace(
+                  'KSU_VERSION := $(shell expr 40000 + $(KSU_LOCAL_VERSION) - 2815)',
+                  'KSU_VERSION := $(shell expr 40000 + $(KSU_LOCAL_VERSION) - 2815 2>/dev/null || echo 13000)')
+              open(kb, 'w', encoding='utf-8').write(ks)
+              print('patched: KernelSU/kernel/Kbuild (KSU_VERSION fallback 13000)')
+          else:
+              print('Kbuild KSU_VERSION fallback already present')
           PYEOF
           echo "--- 验证 ---"
           grep -rn "TWA_RESUME" KernelSU/kernel/ | grep -v Binary || echo "OK: 无 TWA_RESUME 残留"
