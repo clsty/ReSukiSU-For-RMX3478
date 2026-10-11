@@ -227,16 +227,26 @@ jobs:
           git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
           python3 mkbootimg/unpack_bootimg.py --boot_img boot.img --out boot_split
           ls boot_split/
-          OS_VER=$(cat boot_split/os_version 2>/dev/null || echo "16.0.0")
-          OS_PATCH=$(cat boot_split/os_patch_level 2>/dev/null || echo "2026-08")
-          HDR_VER=$(cat boot_split/header_version 2>/dev/null || echo "4")
-          echo "os_version=$OS_VER os_patch=$OS_PATCH header=$HDR_VER"
+          # ★ header_version 必须 =3: ABL 只接受 v3 头 (设备实测: v4头 -> init_user0_failed -> recovery)
+          # 官方工具 --format mkbootimg -0 读回权威参数 (unpack 不落 header_version 文件, 不能 cat fallback)
+          BOOT_ARGS=$(python3 mkbootimg/unpack_bootimg.py --boot_img boot.img --format mkbootimg -0 2>/dev/null | tr '\0' '\n')
+          HDR_VER=$(printf '%s\n' "$BOOT_ARGS" | grep -A1 '^--header_version$' | tail -1)
+          OS_VER=$(printf '%s\n' "$BOOT_ARGS" | grep -A1 '^--os_version$' | tail -1)
+          OS_PATCH=$(printf '%s\n' "$BOOT_ARGS" | grep -A1 '^--os_patch_level$' | tail -1)
+          [ -n "$HDR_VER" ] || HDR_VER=3
+          if [ "$HDR_VER" != "3" ]; then
+            echo "!! 官方 header_version=$HDR_VER 非 3, 强制 3 (ABL 只接受 v3)"
+            HDR_VER=3
+          fi
+          [ -n "$OS_VER" ]   || OS_VER=16.0.0
+          [ -n "$OS_PATCH" ] || OS_PATCH=2026-09
+          echo "os_version=$OS_VER os_patch=$OS_PATCH header=$HDR_VER (≥v3 断言通过)"
           echo "官方内核大小: $(stat -c%s boot_split/kernel)"
           echo "D0 内核大小:   $(stat -c%s kernel/${{ env.KERNEL_OUT }}/arch/arm64/boot/Image)"
           python3 mkbootimg/mkbootimg.py \
             --kernel kernel/${{ env.KERNEL_OUT }}/arch/arm64/boot/Image \
             --ramdisk boot_split/ramdisk \
-            --cmdline "$(cat boot_split/cmdline)" \
+            --cmdline "$(cat boot_split/cmdline 2>/dev/null)" \
             --header_version $HDR_VER \
             --os_version "$OS_VER" --os_patch_level "$OS_PATCH" \
             -o new_boot.img
@@ -244,6 +254,10 @@ jobs:
 
       - name: 验证产物 (官方工具链串 + 无 KSU 符号 + sha256)
         run: |
+          # ★ 新 boot 必须为 header_version=3, 否则 ABL 不启动
+          NEW_HDR=$(python3 mkbootimg/unpack_bootimg.py --boot_img new_boot.img --format mkbootimg -0 2>/dev/null | tr '\0' '\n' | grep -A1 '^--header_version$' | tail -1)
+          echo "new_boot header_version=$NEW_HDR"
+          [ "$NEW_HDR" = "3" ] || { echo "!! new_boot.img header_version=$NEW_HDR != 3 (ABL 只接受 v3), 终止"; exit 1; }
           python3 mkbootimg/unpack_bootimg.py --boot_img new_boot.img --out new_split
           echo "新 boot 内核大小: $(stat -c%s new_split/kernel)"
           echo "官方 boot 内核大小 (对照): $(stat -c%s boot_split/kernel)"
