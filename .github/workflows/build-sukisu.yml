@@ -403,9 +403,13 @@ jobs:
           # -Idrivers/usb/typec/tcpc 兜底 tcpc 的 inc/ 前缀 include
           # -DKSU_COMPAT_HAS_SELINUX_STATE: 5.4 高通 selinux_state 无 GKI 字段,
           # 该宏触发 ReSukiSU selinux.c 的 5.4 兼容分支 (selinux_hide fake_state)
+          # -Wno-fortify-source: clang18 (r510928) 在 lineage-23.2 更新的 vendor
+          #   源码 (techpack/camera/cam_io_util.c, oplus touchpanel) 报 snprintf
+          #   截断 -Werror, 官方 clang21 构建无此检查 (2026-10 修复, 仅影响
+          #   调试打印路径, 不影响功能)。
           make ARCH=arm64 CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE' -j$(nproc)
+            KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE -Wno-fortify-source' -j$(nproc)
           ls -la arch/arm64/boot/Image
           echo "--- 内核版本 ---"
           strings arch/arm64/boot/Image | grep -m1 "Linux version"
