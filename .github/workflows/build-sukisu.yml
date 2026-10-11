@@ -10,6 +10,14 @@
 #   3. 构建完成(约 40-90 分钟)后下载 artifact: new_boot.img
 #   4. fastboot 双槽刷入 (见 README.md)
 #
+# ★ mode 输入 (工作流 dispatch 时可选):
+#   - ksu (默认): 集成 ReSukiSU + SUSFS (隐藏 SELinux) 补丁, artifact = resukisu-newboot-v3
+#   - e0: E0 基线 —— 完全相同配方 (clang18/非 LTO、假 __cfi_slowpath、关 PREL32、
+#     modversions CRC 跳过、in-tree 构建、TRACE_INCLUDE/tcpc/oplus 修复、config 配方
+#     钉死, v3 头打包)**但不集成 KSU/SUSFS 源码与 patch**, artifact = e0-baseline-nonlto。
+#     用于设备实测判别: "KSU/SUSFS 补丁" vs "非官方构建配方" 哪个导致 bootanim 断电。
+#     → E0 稳定开机 => KSU/SUSFS 是根因; E0 同样断电 => 配方 (clang18/CFI 兼容) 是根因。
+#
 # 缓存策略 (Actions 页面 → Cache 可查看，GitHub 自动淘汰旧条目):
 #   - clang 工具链 / 内核源码: 固定 key，首次下载后永久复用
 #   - boot.img (nightly): 按 los_date 缓存，同日期只下载一次
@@ -40,6 +48,14 @@ on:
         required: false
         type: string
         default: ''
+      mode:
+        description: '构建模式: ksu = KSU/SUSFS 集成(默认); e0 = E0 基线(同样配方但不含 KSU/SUSFS 补丁)'
+        required: true
+        type: choice
+        options:
+          - ksu
+          - e0
+        default: 'ksu'
 
 env:
   DEVICE: 'oscar'
@@ -47,6 +63,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    env:
+      MODE: ${{ github.event.inputs.mode }}
     steps:
       # ============ 0. 检出本仓库 (含 patches/ 下的 SUSFS patch) ============
       - name: 检出仓库
@@ -175,6 +193,7 @@ jobs:
       #   v4.1.0 无此检查, 与仓库 SUSFS patch 兼容 (结构验证: kernel/ 目录)。
       # 集成: clone 到 KernelSU + symlink drivers/kernelsu → KernelSU/kernel。
       - name: 集成 ReSukiSU (锁定 v4.1.0 + symlink)
+        if: env.MODE == 'ksu'
         run: |
           cd kernel
           # 缓存恢复后 KernelSU 可能已存在，先删再 clone (全量, 不要 --depth 1)
@@ -209,6 +228,7 @@ jobs:
       #   int task_work_add(struct task_struct *, struct callback_head *, bool);
       #   grep TWA_ include/ 无任何枚举定义。
       - name: 修复 ReSukiSU 的 5.4 (sm6375) task_work API 兼容
+        if: env.MODE == 'ksu'
         run: |
           cd kernel
           # 4.45.0) KSU_VERSION 兜底: ReSukiSU/ReSukiSU 仓库没有 miuix 本地分支,
@@ -378,6 +398,7 @@ jobs:
       #   - 已排除 hooks.c/selinuxfs.c (ReSukiSU 自带 selinux_hide)
       # 应用时机必须在 ReSukiSU 集成之后 (fs/susfs.c 由本 patch 提供)。
       - name: 应用 SUSFS 5.4 patch
+        if: env.MODE == 'ksu'
         run: |
           cd kernel
           patch -p1 < ../patches/50_add_susfs_in_kernel-5.4.patch
@@ -397,6 +418,7 @@ jobs:
       #   避免清除 mnt_expiry_mark, 与 ksys_umount 一致); path ref 由调用方
       #   try_umount(kern_path) 获取、由本函数释放。
       - name: 注入 path_umount 到 fs/namespace.c (修复 kernel_umount 链接)
+        if: env.MODE == 'ksu'
         run: |
           cd kernel
           python3 - <<'PYEOF'
@@ -619,10 +641,6 @@ jobs:
             -e DM_CRYPT -e DM_DEFAULT_KEY -e BLK_DEV_DM \
             -e CRYPTO_ECB -e CRYPTO_XTS -e CRYPTO_AES -e CRYPTO_SHA512 \
             -d F2FS_CHECK_FS -d F2FS_FAULT_INJECTION
-          # 开启 ReSukiSU + SUSFS 全部 9 个子开关 (SUS_PATH/SUS_MOUNT/SUS_KSTAT/
-          # SPOOF_UNAME/ENABLE_LOG/HIDE_KSU_SUSFS_SYMBOLS/SPOOF_CMDLINE_OR_BOOTCONFIG/
-          # OPEN_REDIRECT/SUS_MAP)。ReSukiSU Kconfig: KSU_SUSFS 依赖
-          # THREAD_INFO_IN_TASK && 64BIT —— 5.4 arm64 满足。
           # ★ 版本号必须与官方 ROM 完全一致 (2026-10-11 设备实证更新):
           #   vendor 分区预编译模块 (qca_cld3_wlan.ko/btpower/adsp/q6 等) 加载时
           #   校验 vermagic, 本机 (已刷 23.2-20261005-nightly-oscar) 运行内核
@@ -634,15 +652,24 @@ jobs:
           # 修复: -d CONFIG_LOCALVERSION_AUTO 去掉自动后缀, 写死官方 LOCALVERSION
           #   (g84e7d691ee3a = lineage-23.2 分支 tip, 与已刷系统一致);
           #   保持 MODVERSIONS=y (官方默认 y)。
-          # KSU_TRACEPOINT_HOOK 是 GKI 2 (5.10+) 的 tracepoint 模式, 5.4 不用, 显式关闭。
-          ./scripts/config -e KSU -e KALLSYMS -e KALLSYMS_ALL \
-            -e KSU_SUSFS \
-            -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
-            -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
-            -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-            -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT \
-            -e KSU_SUSFS_SUS_MAP \
-            -d KSU_TRACEPOINT_HOOK \
+          # ★ E0 模式 (env.MODE=e0): 不集成 KSU/SUSFS -> 不开启 KSU/KSU_SUSFS
+          #   等开关 (无 Kconfig 对应项, -e 会报错); LOCALVERSION 写死 + 存储/
+          #   加密钉死属配方, 双模式一致。
+          #   KALLSYMS/KALLSYMS_ALL: 官方 oscar config 本身就是 =y (D0 对照),
+          #   defconfig 默认即 y, 属配方 —— 双模式统一显式开启防漂移。
+          ./scripts/config -e KALLSYMS -e KALLSYMS_ALL
+          if [ "$MODE" = "ksu" ]; then
+            # KSU_TRACEPOINT_HOOK 是 GKI 2 (5.10+) 的 tracepoint 模式, 5.4 不用, 显式关闭。
+            ./scripts/config -e KSU \
+              -e KSU_SUSFS \
+              -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
+              -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
+              -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT \
+              -e KSU_SUSFS_SUS_MAP \
+              -d KSU_TRACEPOINT_HOOK
+          fi
+          ./scripts/config \
             -d CONFIG_LOCALVERSION_AUTO \
             --set-str CONFIG_LOCALVERSION "-qgki-g84e7d691ee3a" || true
           if [ -n "${{ github.event.inputs.custom_version }}" ]; then
@@ -650,10 +677,16 @@ jobs:
           fi
           make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE' olddefconfig
+            KCFLAGS='-I. -Idrivers/usb/typec/tcpc' olddefconfig
           echo "--- 配置验证 ---"
-          grep -E "CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KSU_SUSFS|CONFIG_LOCALVERSION|CONFIG_DEBUG_FS|CONFIG_PAGE_OWNER|CONFIG_MODVERSIONS" .config \
-            || echo "!! 未找到 KSU/SUSFS 配置，请检查 ReSukiSU 集成是否成功"
+          if [ "$MODE" = "ksu" ]; then
+            grep -E "CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KSU_SUSFS" .config \
+              || { echo "!! 未找到 KSU/SUSFS 配置, 请检查 ReSukiSU 集成是否成功"; exit 1; }
+          else
+            echo "E0 模式: 不集成 KSU/SUSFS"
+            grep -qE "^CONFIG_KSU=y" .config && { echo "!! E0 不应有 CONFIG_KSU=y"; exit 1; } || true
+          fi
+          grep -E "CONFIG_LOCALVERSION|CONFIG_DEBUG_FS|CONFIG_PAGE_OWNER|CONFIG_MODVERSIONS" .config || true
           # ★ 存储/加密/文件系统关键项 =y 断言 (对照官方 config_official.txt)
           CFG_FAIL=0
           for k in \
@@ -696,14 +729,19 @@ jobs:
           # KCFLAGS=-I. 让内核根进入 include 搜索链 (高通相对 include 必需)
           # -Idrivers/usb/typec/tcpc 兜底 tcpc 的 inc/ 前缀 include
           # -DKSU_COMPAT_HAS_SELINUX_STATE: 5.4 高通 selinux_state 无 GKI 字段,
-          # 该宏触发 ReSukiSU selinux.c 的 5.4 兼容分支 (selinux_hide fake_state)
+          # 该宏触发 ReSukiSU selinux.c 的 5.4 兼容分支 (selinux_hide fake_state);
+          #   仅 ksu 模式需要 (E0 无 KSU 源码, 加宏无意义)
           # -Wno-fortify-source: clang18 (r510928) 在 lineage-23.2 更新的 vendor
           #   源码 (techpack/camera/cam_io_util.c, oplus touchpanel) 报 snprintf
           #   截断 -Werror, 官方 clang21 构建无此检查 (2026-10 修复, 仅影响
           #   调试打印路径, 不影响功能)。
+          KFLAGS_LSU=""
+          if [ "$MODE" = "ksu" ]; then
+            KFLAGS_LSU=" -DKSU_COMPAT_HAS_SELINUX_STATE"
+          fi
           make ARCH=arm64 CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE -Wno-fortify-source' -j$(nproc)
+            KCFLAGS="-I. -Idrivers/usb/typec/tcpc$KFLAGS_LSU -Wno-fortify-source" -j$(nproc)
           ls -la arch/arm64/boot/Image
           echo "--- 内核版本 ---"
           strings arch/arm64/boot/Image | grep -m1 "Linux version"
@@ -858,7 +896,7 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: resukisu-newboot-v3
+          name: ${{ env.MODE == 'e0' && 'e0-baseline-nonlto' || 'resukisu-newboot-v3' }}
           path: |
             new_boot.img
             SHA256SUMS.txt
