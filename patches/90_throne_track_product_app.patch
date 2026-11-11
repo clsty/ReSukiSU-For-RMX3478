@@ -1,0 +1,25 @@
+diff --git a/kernel/manager/throne_tracker.c b/kernel/manager/throne_tracker.c
+index f6c65fc..c976965 100644
+--- a/kernel/manager/throne_tracker.c
++++ b/kernel/manager/throne_tracker.c
+@@ -221,7 +221,8 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
+             // we were calling is_manager_apk inside iterate_dir
+             // now we defer file opens after iterate_dir
+             // this way we dont open apks while inside that
+-            if (!strstarts(candidate_path, "/data/ap"))
++            if (!(strstarts(candidate_path, "/data/ap") ||
++                  strstarts(candidate_path, "/product/app/")))
+                 goto skip_iterate;
+ 
+             bool is_manager = is_manager_apk(candidate_path, &signature_index);
+@@ -403,6 +404,10 @@ void do_track_throne(void *data)
+     if (need_search) {
+         pr_info("Searching for manager(s)...\n");
+         search_manager("/data/app", 2, &uid_list);
++        // A manager preinstalled as a system app lives in a read-only system
++        // partition, so it is never staged under /data/app. Scan it too,
++        // otherwise such a manager is found by no path at all.
++        search_manager("/product/app", 2, &uid_list);
+         pr_info("Manager search finished\n");
+     }
+ 

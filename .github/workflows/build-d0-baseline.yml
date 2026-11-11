@@ -80,6 +80,13 @@ env:
   KERNEL_COMMIT: '84e7d691ee3a094de68628c488847a4dd632e7eb'
   CLANG_VER: 'clang-r563880c'
   KERNEL_OUT: 'kernel-out'   # O= 分离构建输出目录 (官方 Android build.sh O=$OUT_DIR)
+  # ---- 出厂预置 root 管理器身份 (mode=ksu) ----
+  # 内核编进"包名 + 自签证书"，管理器不再依赖 /data/adb/ksu/.dynamic_manager
+  # (那是 /data 里的文件，恢复出厂设置即丢失)。值取自设备上 .dynamic_manager
+  # 与预装 APK 的签名，三者必须一致；换 key 时三处一起改。
+  KSU_MANAGER_PACKAGE: 'kqdfbe.qrxinh.qcvndy'
+  KSU_EXPECTED_SIZE: '0x2e7'
+  KSU_EXPECTED_HASH: '8078e577cb5eb762c3f8188daf83cc379036c47e8dcc939f0382307d39a2d0f1'
 
 jobs:
   build:
@@ -221,6 +228,18 @@ jobs:
           grep -rln "put_task_struct" KernelSU/kernel/ | while read f; do grep -q "sched/task.h" "$f" || { echo "!! $f 缺 sched/task.h"; exit 1; }; done
           echo "OK: put_task_struct 文件均已 include sched/task.h"
           echo "OK: TWA_RESUME/put_seccomp_filter/pgtable 由 rc1 kernel_compat 自适配, 无需手动"
+
+      # 上游 track_throne 只扫 /data/app，预装成系统应用的 root 管理器因此永远
+      # 不被认领。恢复出厂设置会抹掉 /data/app，预装(APK 在 /product/app)才能
+      # 存活 —— 前提是内核也扫这个目录。见 patches/90_throne_track_product_app.patch。
+      - name: 应用补丁 track_throne 兼扫 /product/app
+        if: env.MODE == 'ksu'
+        run: |
+          cd kernel/KernelSU
+          patch -p1 --forward < ../../patches/90_throne_track_product_app.patch
+          echo "--- 验证 ---"
+          grep -n 'search_manager("/product/app", 2' kernel/manager/throne_tracker.c
+          grep -n 'strstarts(candidate_path, "/product/app/")' kernel/manager/throne_tracker.c
 
       - name: 应用 SUSFS 5.4 patch
         if: env.MODE == 'ksu'
@@ -394,20 +413,31 @@ jobs:
           #    OPTIONAL_SECCOMP_FILTER_RELEASE 等), 无需手动 KCFLAGS 宏。
           KFLAGS_LSU=""
           MAKE_CC="clang"
+          MGR_VARS=""
           if [ "$MODE" = "ksu" ]; then
             export CCACHE_DIR=$HOME/.ccache
             ccache -M 2G
             MAKE_CC="ccache clang"
+            # 管理器身份编进内核 (Kbuild: ifdef KSU_EXPECTED_SIZE/HASH/KSU_MANAGER_PACKAGE)
+            MGR_VARS="KSU_MANAGER_PACKAGE=$KSU_MANAGER_PACKAGE KSU_EXPECTED_SIZE=$KSU_EXPECTED_SIZE KSU_EXPECTED_HASH=$KSU_EXPECTED_HASH"
           fi
           make O=${{ env.KERNEL_OUT }} ARCH=arm64 \
             CC="$MAKE_CC" CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- LD=ld.lld NM=llvm-nm \
             OBJCOPY=llvm-objcopy STRIP=llvm-strip AR=llvm-ar LLVM_IAS=1 \
-            KCFLAGS="-I. -Idrivers/usb/typec/tcpc$KFLAGS_LSU" -j$(nproc)
+            KCFLAGS="-I. -Idrivers/usb/typec/tcpc$KFLAGS_LSU" $MGR_VARS -j$(nproc)
           ls -la ${{ env.KERNEL_OUT }}/arch/arm64/boot/Image ${{ env.KERNEL_OUT }}/vmlinux
           echo "--- 内核版本 (期 5.4.302-qgki-g84e7d691ee3a, clang21, +lto) ---"
           strings -a ${{ env.KERNEL_OUT }}/arch/arm64/boot/Image | grep -m1 "Linux version"
           strings -a ${{ env.KERNEL_OUT }}/arch/arm64/boot/Image | grep -m1 "clang version 21"
+          if [ "$MODE" = "ksu" ]; then
+            echo "--- 预置管理器身份校验 (包名与证书 sha256 应在 .rodata 内) ---"
+            strings -a ${{ env.KERNEL_OUT }}/arch/arm64/boot/Image | grep -m1 -F "$KSU_MANAGER_PACKAGE" \
+              || { echo "!! Image 内无管理器包名: KSU_MANAGER_PACKAGE 未生效"; exit 1; }
+            strings -a ${{ env.KERNEL_OUT }}/arch/arm64/boot/Image | grep -m1 -F "${KSU_EXPECTED_HASH:0:16}" \
+              || { echo "!! Image 内无自签证书 hash: KSU_EXPECTED_HASH 未生效"; exit 1; }
+            echo "OK: 管理器包名与自签证书已编入内核"
+          fi
 
       - name: 下载官方 boot.img (los_date, 校验 sha256)
         run: |
